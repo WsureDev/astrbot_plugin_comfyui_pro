@@ -2307,7 +2307,7 @@ class ComfyUIPlugin(Star):
         if not use_multi_image_mode:
             event._comfy_extracted_prompt = cleaned_entries[0]["prompt"]
             event._comfy_extracted_loras = cleaned_entries[0].get("lora_selections", [])
-            logger.info(f"[ComfyUI] 📝 检测到单图模式: {cleaned_prompts[0][:50]}...")
+            logger.info(f"[ComfyUI] 📝 检测到单图模式: {cleaned_prompts[0]}")
             # 丢弃绘图提示词，避免污染历史记录上下文
             if self.discard_prompt_from_history:
                 resp.completion_text = cleaned_text
@@ -2566,7 +2566,7 @@ class ComfyUIPlugin(Star):
                 )
                 return
 
-            logger.info(f"[ComfyUI] 🎨 异步生成开始 | Prompt: {prompt[:50]}...")
+            logger.info(f"[ComfyUI] 🎨 异步生成开始 | Prompt: {prompt}")
             img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
 
             if not img_data:
@@ -2702,7 +2702,7 @@ class ComfyUIPlugin(Star):
             # 生成并发送图片
             if marker:
                 try:
-                    logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt[:50]}...")
+                    logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt}")
                     img_data, error_msg = await self.api.generate(
                         marker.prompt,
                         lora_selections=marker.lora_selections,
@@ -2851,9 +2851,9 @@ class ComfyUIPlugin(Star):
                 yield message
                 return
 
-            log_message = f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt[:50]}..."
+            log_message = f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt}"
             if negative_prompt:
-                log_message += f" | Negative: {negative_prompt[:50]}..."
+                log_message += f" | Negative: {negative_prompt}"
             logger.info(log_message)
 
             # 调用 API
