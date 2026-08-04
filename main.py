@@ -43,6 +43,10 @@ class ComfyUIPlugin(Star):
     _FORCE_DRAW_MIN_REPLY_LENGTH = 100
     _DRAW_FAILURE_CONTEXT_TTL_SECONDS = 600
     _DRAW_FAILURE_CONTEXT_LIMIT = 5
+    _DRAW_NEGATIVE_SPLIT_PATTERN = re.compile(
+        r"\s+--(?:neg|negative)\b",
+        flags=re.IGNORECASE,
+    )
     _PIC_PROMPT_TAG_PATTERN = re.compile(
         r'<pic\b[^>]*\bprompt=(?P<quote>["\'])(?P<prompt>.*?)(?P=quote)[^>]*?/?>\s*(?:</pic>)?',
         flags=re.DOTALL | re.IGNORECASE,
@@ -329,10 +333,27 @@ class ComfyUIPlugin(Star):
             return ""
         return text[:limit] + ("..." if len(text) > limit else "")
 
+    @classmethod
+    def _parse_draw_command_payload(cls, raw_message: str) -> tuple[str, str | None]:
+        full_message = str(raw_message or "").strip()
+        parts = full_message.split(None, 1)
+        arg_text = parts[1].strip() if len(parts) > 1 else ""
+        if not arg_text:
+            return "", None
+
+        match = cls._DRAW_NEGATIVE_SPLIT_PATTERN.search(arg_text)
+        if not match:
+            return arg_text, None
+
+        prompt = arg_text[:match.start()].strip()
+        negative_prompt = arg_text[match.end():].strip()
+        negative_prompt = re.sub(r"^(=|:|：)\s*", "", negative_prompt).strip()
+        return prompt, negative_prompt or None
+
     def _extract_command_prompt(self, event: AstrMessageEvent) -> str:
         full_message = (getattr(event, "message_str", "") or "").strip()
-        parts = full_message.split(None, 1)
-        return parts[1].strip() if len(parts) > 1 else ""
+        prompt, _ = self._parse_draw_command_payload(full_message)
+        return prompt
 
     def _remember_draw_failure(
         self,
@@ -1111,11 +1132,13 @@ class ComfyUIPlugin(Star):
         
         try:
             full_message = event.message_str.strip()
-            parts = full_message.split(' ', 1)
-            prompt = parts[1].strip() if len(parts) > 1 else ""
+            prompt, negative_prompt = self._parse_draw_command_payload(full_message)
 
             if not prompt:
-                message = "❌ 请输入提示词，例如：/画图 1girl, smile"
+                message = (
+                    "❌ 请输入提示词，例如：/画图 1girl, smile\n"
+                    "可选负面词：/画图 1girl, smile --neg lowres, bad hands"
+                )
                 self._remember_draw_failure(event, message, source="用户指令")
                 yield event.plain_result(message)
                 return
@@ -1137,7 +1160,12 @@ class ComfyUIPlugin(Star):
                 return
 
             event.set_extra("comfy_draw_source", "用户指令")
-            async for result in self.comfyui_txt2img(event, prompt=prompt, direct_send=direct_send):
+            async for result in self.comfyui_txt2img(
+                event,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                direct_send=direct_send,
+            ):
                 if isinstance(result, str):
                     yield event.plain_result(result)
                 else:
@@ -1193,8 +1221,9 @@ class ComfyUIPlugin(Star):
             "━━━━━━━━━━━━━━━━━━",
             "",
             "【基础指令】",
-            "  /画图 <提示词>     生成图片（转发模式）",
-            "  /画图no <提示词>   生成图片（直发模式）",
+            "  /画图 <提示词> [--neg <负面词>]     生成图片（转发模式）",
+            "  /画图no <提示词> [--neg <负面词>]   生成图片（直发模式）",
+            "  /重绘 <提示词> [--neg <负面词>]     直接重绘",
             "  /comfy帮助         显示此帮助",
             "",
             "【LLM 模式】",
@@ -2120,10 +2149,12 @@ class ComfyUIPlugin(Star):
     async def cmd_reroll(self, event: AstrMessageEvent):
         full_msg = (event.message_str or "").strip()
         full_msg = re.sub(r'\[At:\d+\]\s*', '', full_msg).strip()
-        parts = full_msg.split(None, 1)
-        prompt = parts[1].strip() if len(parts) > 1 else ""
+        prompt, _ = self._parse_draw_command_payload(full_msg)
         if not prompt:
-            yield event.plain_result("📖 用法: /重绘 <提示词>\n示例: /重绘 1girl, silver hair, cinematic lighting")
+            yield event.plain_result(
+                "📖 用法: /重绘 <提示词> [--neg <负面词>]\n"
+                "示例: /重绘 1girl, silver hair, cinematic lighting --neg lowres, bad hands"
+            )
             return
         async for result in self._handle_paint_logic(event, direct_send=True):
             yield result
@@ -2716,7 +2747,17 @@ class ComfyUIPlugin(Star):
         result.chain.clear()
         logger.info(f"[ComfyUI] ✅ 多图模式发送完成")
     @llm_tool(name="comfyui_txt2img")
-    async def comfyui_txt2img(self, event: AstrMessageEvent, ctx: Context = None, prompt: str = None, text: str = None, img_width: int = None, img_height: int = None, direct_send: bool = False) -> MessageEventResult:
+    async def comfyui_txt2img(
+        self,
+        event: AstrMessageEvent,
+        ctx: Context = None,
+        prompt: str = None,
+        text: str = None,
+        negative_prompt: str = None,
+        img_width: int = None,
+        img_height: int = None,
+        direct_send: bool = False,
+    ) -> MessageEventResult:
         """ComfyUI 文生图工具"""
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         
@@ -2735,6 +2776,8 @@ class ComfyUIPlugin(Star):
         # 参数处理
         if not prompt and text:
             prompt = text
+        if negative_prompt is not None:
+            negative_prompt = str(negative_prompt).strip() or None
 
         if not prompt:
             message = "❌ 未提供 prompt，请重试"
@@ -2780,6 +2823,21 @@ class ComfyUIPlugin(Star):
                 yield message
                 return
 
+            if negative_prompt:
+                passed, sensitive = self._check_sensitive(negative_prompt, event)
+                if not passed:
+                    tip = "、".join(sensitive[:5])
+                    logger.warning(f"[ComfyUI] 用户 {event.get_sender_id()} 的负面提示词触发敏感词: {tip}")
+                    message = f"🚫 检测到负面提示词含敏感词：{tip}，无法生成"
+                    self._remember_draw_failure(
+                        event,
+                        message,
+                        prompt=prompt,
+                        source=draw_source,
+                    )
+                    yield message
+                    return
+
             # 冷却检查
             ok, remain = self._check_cooldown(event)
             if not ok:
@@ -2793,10 +2851,17 @@ class ComfyUIPlugin(Star):
                 yield message
                 return
 
-            logger.info(f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt[:50]}...")
+            log_message = f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt[:50]}..."
+            if negative_prompt:
+                log_message += f" | Negative: {negative_prompt[:50]}..."
+            logger.info(log_message)
 
             # 调用 API
-            img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
+            img_data, error_msg = await self.api.generate(
+                prompt,
+                lora_selections=lora_selections,
+                negative_prompt=negative_prompt,
+            )
 
             if not img_data:
                 logger.error(f"[ComfyUI] 生成失败: {error_msg}")

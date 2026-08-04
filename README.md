@@ -93,11 +93,12 @@
 ![llm演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/llm.png)
 
 ### 方式二：直接指令
-*   `/画图 <提示词>`: 以合并转发的方式发送图片。
+*   `/画图 <提示词> [--neg <负面词>]`: 以合并转发的方式发送图片。
 *   
 ![指令演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/draw.png)
 
-*   `/画图no <提示词>`: 直接发送图片，更简洁。
+*   `/画图no <提示词> [--neg <负面词>]`: 直接发送图片，更简洁。
+*   未提供 `--neg` 时，会保留工作流 JSON 内置的负面提示词；若配置了额外默认负面词，则继续追加。
 
 ![指令演示](https://raw.githubusercontent.com/lumingya/astrbot_plugin_comfyui_pro/main/assets/drawno.png)
 

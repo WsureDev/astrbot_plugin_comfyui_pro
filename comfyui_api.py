@@ -1068,8 +1068,8 @@ class ComfyUI:
         with open(self.workflow_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _inject_params(self, workflow, prompt, lora_selections=None):
-        """Inject prompt, optional LoRA selections, steps overrides, and seeds into workflow."""
+    def _inject_params(self, workflow, prompt, lora_selections=None, negative_prompt=None):
+        """Inject prompts, optional LoRA selections, steps overrides, and seeds into workflow."""
         node = workflow.get(self.input_id)
         if not node:
             logger.error(f"critical: input node id {self.input_id} not found in workflow")
@@ -1090,21 +1090,40 @@ class ComfyUI:
                 inputs[key] = prompt
                 break
 
-        if self.neg_node_id and self.neg_prompt:
+        extra_negative_parts = []
+        config_neg = str(self.neg_prompt or "").strip()
+        runtime_neg = str(negative_prompt or "").strip() if negative_prompt is not None else ""
+        if config_neg:
+            extra_negative_parts.append(config_neg)
+        if runtime_neg:
+            extra_negative_parts.append(runtime_neg)
+
+        if self.neg_node_id:
             neg_node = workflow.get(self.neg_node_id)
             if neg_node:
                 n_inputs = neg_node.get("inputs", {})
                 n_keys = ["text", "string", "negative", "text_negative", "prompt"]
                 for n_key in n_keys:
                     if n_key in n_inputs:
-                        existing_neg = str(n_inputs.get(n_key, "")).strip()
-                        config_neg = self.neg_prompt.strip()
-
-                        if existing_neg and config_neg:
-                            n_inputs[n_key] = f"{existing_neg}, {config_neg}"
-                        elif config_neg:
-                            n_inputs[n_key] = config_neg
+                        if extra_negative_parts:
+                            existing_neg = str(n_inputs.get(n_key, "")).strip()
+                            merged_neg = ", ".join(extra_negative_parts)
+                            if existing_neg:
+                                n_inputs[n_key] = f"{existing_neg}, {merged_neg}"
+                            else:
+                                n_inputs[n_key] = merged_neg
                         break
+                else:
+                    if runtime_neg:
+                        logger.warning(
+                            "[ComfyUI] negative node %s has no writable text input; runtime negative prompt ignored",
+                            self.neg_node_id,
+                        )
+            elif runtime_neg:
+                logger.warning(
+                    "[ComfyUI] negative node id %s not found in workflow; runtime negative prompt ignored",
+                    self.neg_node_id,
+                )
 
         if self.lora_control_enabled and lora_selections:
             applied = self._apply_lora_selections(workflow, lora_selections)
@@ -1236,7 +1255,7 @@ class ComfyUI:
 
         return override_count
 
-    async def generate(self, prompt, lora_selections=None):
+    async def generate(self, prompt, lora_selections=None, negative_prompt=None):
         """Generate an image with the current workflow."""
         client_id = str(random.randint(100000, 999999))
         try:
@@ -1250,7 +1269,12 @@ class ComfyUI:
         if injected_hints:
             logger.info(f"[ComfyUI] injected LoRA prompt hints: {', '.join(injected_hints)}")
 
-        self._inject_params(workflow, prompt, resolved_loras)
+        self._inject_params(
+            workflow,
+            prompt,
+            resolved_loras,
+            negative_prompt=negative_prompt,
+        )
 
         async with aiohttp.ClientSession() as session:
             payload = {"prompt": workflow, "client_id": client_id}
