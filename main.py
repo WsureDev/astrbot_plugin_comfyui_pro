@@ -527,6 +527,50 @@ class ComfyUIPlugin(Star):
         cleaned = self._sanitize_context_content_for_prompt(content)
         return cleaned, cleaned != content
 
+    @staticmethod
+    def _redact_comfy_tool_call_arguments(entry: dict) -> bool:
+        """从 assistant tool_calls 中脱敏 ComfyUI 绘图参数，同时保留调用结构。"""
+        tool_calls = entry.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return False
+
+        modified = False
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            if function.get("name") != "comfyui_txt2img":
+                continue
+
+            arguments = function.get("arguments")
+            arguments_were_string = isinstance(arguments, str)
+            if arguments_were_string:
+                try:
+                    arguments = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {}
+                    modified = True
+            elif isinstance(arguments, dict):
+                arguments = copy.deepcopy(arguments)
+            else:
+                arguments = {}
+                modified = True
+
+            for key in ("prompt", "text", "negative_prompt"):
+                if key in arguments:
+                    arguments[key] = "[removed by ComfyUI history cleanup]"
+                    modified = True
+
+            function["arguments"] = (
+                json.dumps(arguments, ensure_ascii=False)
+                if arguments_were_string
+                else arguments
+            )
+
+        return modified
+
     def _clean_pic_tags_from_req(self, req):
         """从请求的 conversation.history 中清理 <pic> 标签"""
         conversation = getattr(req, "conversation", None)
@@ -554,6 +598,8 @@ class ComfyUIPlugin(Star):
             if entry.get("role") != "assistant":
                 continue
             cleaned_content, modified = self._clean_history_content(entry.get("content", ""))
+            if self._redact_comfy_tool_call_arguments(entry):
+                modified = True
             if modified:
                 entry["content"] = cleaned_content
                 cleaned += 1
@@ -2721,7 +2767,11 @@ class ComfyUIPlugin(Star):
             return
 
         # 只在有提取到提示词时才需要清理
-        has_prompt = hasattr(event, '_comfy_extracted_prompt') or hasattr(event, '_comfy_segments')
+        has_prompt = (
+            hasattr(event, '_comfy_extracted_prompt')
+            or hasattr(event, '_comfy_segments')
+            or bool(event.get_extra("comfy_llm_tool_prompt_used"))
+        )
         if not has_prompt:
             return
 
@@ -2751,6 +2801,8 @@ class ComfyUIPlugin(Star):
                 cleaned_content, content_modified = self._clean_history_content(
                     entry.get("content", ""),
                 )
+                if self._redact_comfy_tool_call_arguments(entry):
+                    content_modified = True
                 if content_modified:
                     entry["content"] = cleaned_content
                     modified = True
@@ -2872,6 +2924,7 @@ class ComfyUIPlugin(Star):
     ) -> MessageEventResult:
         """ComfyUI 文生图工具"""
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
+        is_llm_tool_call = draw_source == "LLM 工具"
         
         # 权限检查
         allowed, reason = self._check_access(event)
@@ -2905,6 +2958,9 @@ class ComfyUIPlugin(Star):
                 self._remember_draw_failure(event, message, source=draw_source)
                 yield message
                 return
+
+        if is_llm_tool_call:
+            event.set_extra("comfy_llm_tool_prompt_used", True)
 
         # API 检查
         if not getattr(self, 'api', None):
@@ -2999,7 +3055,7 @@ class ComfyUIPlugin(Star):
             # 发送结果
             if direct_send:
                 image_component = Image.fromFileSystem(str(img_path))
-                yield event.chain_result([image_component])
+                result = event.chain_result([image_component])
             else:
                 self_id = self._get_self_id(event) or "0"
                 image_component = Image.fromFileSystem(str(img_path))
@@ -3008,7 +3064,13 @@ class ComfyUIPlugin(Star):
                     nickname="ComfyUI",
                     content=[image_component]
                 )
-                yield event.chain_result([forward_node])
+                result = event.chain_result([forward_node])
+
+            if is_llm_tool_call:
+                await event.send(result)
+                yield "Image generated successfully and sent to the user. Do not call the same tool again for this request."
+            else:
+                yield result
 
         except Exception as e:
             logger.error(f"[ComfyUI] 执行异常: {e}")
