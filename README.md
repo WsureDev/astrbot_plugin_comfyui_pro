@@ -106,6 +106,7 @@
 *   `/comfy_ls`: 列出所有可用的工作流，并显示序号。
 *   `/comfy_use <序号> [input_id] [output_id]`: 通过序号快速切换工作流，该方法不需要重载插件。
 *   `/comfy_lock on|off|status`: 动态查看或切换全局锁定状态。
+*   `/comfy_history on|off|status`: 当全局启用“丢弃绘图提示词历史”时，管理员可为当前会话临时保留提示词；使用 `/new` 后自动关闭。
 *   `/违禁级别 <none/lite/full>`: 调整当前群的敏感词拦截等级。
 *   `/comfy帮助`: 查看所有可用指令。
 

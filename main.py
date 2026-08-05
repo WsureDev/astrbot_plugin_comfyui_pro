@@ -90,6 +90,7 @@ class ComfyUIPlugin(Star):
         logger.info(f"[ComfyUI] 🖼️ 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
         
         self.discard_prompt_from_history = llm_settings.get("discard_prompt_from_history", False)
+        self._prompt_history_keep_conversations = {}
         self.force_draw_when_no_prompt = bool(llm_settings.get("force_draw_when_no_prompt", False))
         self.target_image_count = self._coerce_target_image_count(
             llm_settings.get("target_image_count", 1),
@@ -480,9 +481,51 @@ class ComfyUIPlugin(Star):
         # 清理历史中的绘图提示词
         if self.discard_prompt_from_history:
             try:
-                self._clean_pic_tags_from_req(req)
+                if await self._is_prompt_history_keep_active(event, req):
+                    logger.info("[ComfyUI] 📝 当前会话保留绘图提示词历史，跳过请求上下文清理")
+                else:
+                    self._clean_pic_tags_from_req(req)
             except Exception as e:
                 logger.error(f"[ComfyUI] 清理提示词异常: {e}")
+
+    async def _get_current_conversation_id(self, event: AstrMessageEvent, req=None) -> str:
+        conversation = getattr(req, "conversation", None) if req is not None else None
+        conversation_id = getattr(conversation, "cid", None)
+        if conversation_id:
+            return str(conversation_id)
+
+        try:
+            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin,
+            )
+        except Exception as e:
+            logger.warning(f"[ComfyUI] 获取当前会话 ID 失败: {e}")
+            return ""
+        return str(conversation_id or "")
+
+    async def _is_prompt_history_keep_active(self, event: AstrMessageEvent, req=None) -> bool:
+        """仅在全局清理开启时，判断当前 conversation 是否启用了保留例外。"""
+        if not self.discard_prompt_from_history:
+            return False
+
+        unified_msg_origin = event.unified_msg_origin
+        enabled_conversation_id = self._prompt_history_keep_conversations.get(
+            unified_msg_origin,
+        )
+        if not enabled_conversation_id:
+            return False
+
+        current_conversation_id = await self._get_current_conversation_id(event, req)
+        if current_conversation_id != enabled_conversation_id:
+            self._prompt_history_keep_conversations.pop(unified_msg_origin, None)
+            logger.info("[ComfyUI] 🧹 检测到 conversation 已切换，提示词历史保留例外已自动关闭")
+            return False
+        return True
+
+    def _clean_history_content(self, content):
+        """清理字符串或 AstrBot 结构化 content 中的 ComfyUI 控制内容。"""
+        cleaned = self._sanitize_context_content_for_prompt(content)
+        return cleaned, cleaned != content
 
     def _clean_pic_tags_from_req(self, req):
         """从请求的 conversation.history 中清理 <pic> 标签"""
@@ -495,6 +538,7 @@ class ComfyUIPlugin(Star):
         if not history_raw:
             return
 
+        history_was_string = isinstance(history_raw, str)
         try:
             history = json.loads(history_raw) if isinstance(history_raw, str) else history_raw
         except (json.JSONDecodeError, TypeError):
@@ -509,16 +553,18 @@ class ComfyUIPlugin(Star):
                 continue
             if entry.get("role") != "assistant":
                 continue
-            content = entry.get("content", "")
-            if isinstance(content, str):
-                stripped = self._strip_comfy_control_tags(content, remove_think=True)
-                if self._find_pic_prompt_matches(content) or "<lora " in content.lower():
-                    entry["content"] = stripped
-                    cleaned += 1
+            cleaned_content, modified = self._clean_history_content(entry.get("content", ""))
+            if modified:
+                entry["content"] = cleaned_content
+                cleaned += 1
 
         if cleaned:
             # 写回 conversation.history
-            conversation.history = json.dumps(history, ensure_ascii=False)
+            conversation.history = (
+                json.dumps(history, ensure_ascii=False)
+                if history_was_string
+                else history
+            )
             logger.info(f"[ComfyUI] 🗑️ 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词")
 
     @staticmethod
@@ -1239,6 +1285,7 @@ class ComfyUIPlugin(Star):
                 "  /comfy_save            导入新工作流",
                 "  /comfy_add             步数覆盖（按节点ID）",
                 "  /comfy_lock on|off     切换全局锁定",
+                "  /comfy_history on|off  当前会话保留提示词历史",
                 "  /违禁级别              设置群敏感度",
                 ""
             ])
@@ -1585,6 +1632,65 @@ class ComfyUIPlugin(Star):
             return
 
         yield event.plain_result("❌ 参数无效，用法：/comfy_lock on|off|status")
+
+    @filter.command("comfy_history", aliases=["提示词历史", "提示词保留"])
+    async def cmd_comfy_history(self, event: AstrMessageEvent):
+        """管理员为当前 conversation 设置提示词历史清理例外。"""
+        user_id = str(event.get_sender_id())
+        if user_id not in self.admin_user_ids:
+            yield event.plain_result("🚫 权限不足，仅管理员可切换提示词历史保留")
+            return
+
+        args = event.message_str.split()
+        action = args[1].lower() if len(args) > 1 else "status"
+        unified_msg_origin = event.unified_msg_origin
+
+        if action in ("off", "false", "0", "disable", "stop", "关闭"):
+            self._prompt_history_keep_conversations.pop(unified_msg_origin, None)
+            logger.info(f"[ComfyUI] 管理员 {user_id} 关闭当前会话提示词历史保留例外")
+            yield event.plain_result("🧹 已关闭当前会话的提示词历史保留，恢复全局清理策略")
+            return
+
+        if not self.discard_prompt_from_history:
+            yield event.plain_result(
+                "ℹ️ 全局配置当前为“不清理提示词历史”，所有会话都会保留提示词，"
+                "会话级例外开关无需生效。"
+            )
+            return
+
+        current_conversation_id = await self._get_current_conversation_id(event)
+        is_active = (
+            bool(current_conversation_id)
+            and self._prompt_history_keep_conversations.get(unified_msg_origin)
+            == current_conversation_id
+        )
+
+        if action in ("status", "状态", "查询"):
+            if not is_active:
+                self._prompt_history_keep_conversations.pop(unified_msg_origin, None)
+            yield event.plain_result(
+                "📝 当前会话提示词历史保留\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"当前: {'开启' if is_active else '关闭'}\n"
+                "全局策略: 清理提示词历史\n"
+                "用法: /comfy_history on|off|status\n"
+                "说明: /new 创建新会话后会自动恢复关闭"
+            )
+            return
+
+        if action in ("on", "true", "1", "enable", "start", "开启"):
+            if not current_conversation_id:
+                yield event.plain_result("⚠️ 当前没有可用的 LLM 会话，请先开始对话或使用 /new")
+                return
+            self._prompt_history_keep_conversations[unified_msg_origin] = current_conversation_id
+            logger.warning(f"[ComfyUI] 管理员 {user_id} 开启当前会话提示词历史保留例外")
+            yield event.plain_result(
+                "📝 已开启当前会话的提示词历史保留。\n"
+                "仅当前会话生效；使用 /new 创建新会话后将自动关闭。"
+            )
+            return
+
+        yield event.plain_result("❌ 参数无效，用法：/comfy_history on|off|status")
 
     @filter.command("comfy_ls")
     async def cmd_comfy_list(self, event: AstrMessageEvent):
@@ -2611,6 +2717,9 @@ class ComfyUIPlugin(Star):
         if not self.discard_prompt_from_history:
             return
 
+        if await self._is_prompt_history_keep_active(event):
+            return
+
         # 只在有提取到提示词时才需要清理
         has_prompt = hasattr(event, '_comfy_extracted_prompt') or hasattr(event, '_comfy_segments')
         if not has_prompt:
@@ -2635,12 +2744,15 @@ class ComfyUIPlugin(Star):
 
             modified = False
             for entry in history:
+                if not isinstance(entry, dict):
+                    continue
                 if entry.get("role") != "assistant":
                     continue
-                content = str(entry.get("content", ""))
-                cleaned = self._strip_comfy_control_tags(content, remove_think=True)
-                if cleaned != content.strip():
-                    entry["content"] = cleaned
+                cleaned_content, content_modified = self._clean_history_content(
+                    entry.get("content", ""),
+                )
+                if content_modified:
+                    entry["content"] = cleaned_content
                     modified = True
 
             if modified:
