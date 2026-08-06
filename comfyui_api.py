@@ -18,7 +18,8 @@ DEFAULT_REQUEST_TIMEOUT = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
 DEFAULT_RETRY_TOTAL = 3
 DEFAULT_RETRY_BACKOFF = 1.0
 LORA_MANIFEST_SUFFIX = ".lora.json"
-LORA_CONTEXT_CACHE_SECONDS = 60
+LORA_CONTEXT_CACHE_SECONDS = 5
+LORA_SCAN_CACHE_SECONDS = 60
 LORA_FILE_EXTENSIONS = {
     ".safetensors",
     ".ckpt",
@@ -276,6 +277,61 @@ class ComfyUI:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return json.load(f)
 
+    def _resolve_lora_file_path(self, value) -> Path | None:
+        text = str(value or "").strip().replace("\\", "/")
+        if not text:
+            return None
+
+        candidate = Path(text)
+        candidates = [candidate] if candidate.is_absolute() else [root / candidate for root in self.lora_scan_roots]
+        for path in candidates:
+            try:
+                if path.is_file():
+                    return path.resolve()
+            except OSError:
+                continue
+        return None
+
+    def _is_lora_file_excluded(self, value) -> bool:
+        path = self._resolve_lora_file_path(value)
+        if path is None:
+            return False
+
+        metadata_path = path.with_suffix(".metadata.json")
+        if not metadata_path.exists():
+            return False
+        try:
+            metadata = self._read_json_file(metadata_path)
+        except Exception as e:
+            logger.warning(f"[ComfyUI] failed to read exclusion state from {metadata_path.name}: {e}")
+            return False
+
+        value = metadata.get("exclude", False) if isinstance(metadata, dict) else False
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _is_lora_entry_excluded(self, entry: dict) -> bool:
+        candidates = [
+            entry.get("loader_name"),
+            entry.get("workflow_name"),
+            entry.get("name"),
+            entry.get("display_name"),
+            *list(entry.get("aliases", [])),
+        ]
+        return any(self._is_lora_file_excluded(candidate) for candidate in candidates if candidate)
+
+    def _filter_excluded_lora_catalog(self, catalog: dict) -> dict:
+        filtered = {
+            key: entry
+            for key, entry in catalog.items()
+            if not self._is_lora_entry_excluded(entry)
+        }
+        removed = len(catalog) - len(filtered)
+        if removed:
+            logger.info(f"[ComfyUI] hidden {removed} logically disabled LoRA(s) from the runtime catalog")
+        return filtered
+
     @staticmethod
     def _trim_preview_text(value: str, max_length: int) -> str:
         text = re.sub(r"\s+", " ", str(value or "").strip()).strip(",; ")
@@ -523,7 +579,7 @@ class ComfyUI:
         if (
             self._lora_scan_cache_key == cache_key
             and self._lora_scan_cache is not None
-            and now - self._lora_scan_cache_at < LORA_CONTEXT_CACHE_SECONDS
+            and now - self._lora_scan_cache_at < LORA_SCAN_CACHE_SECONDS
         ):
             return self._lora_scan_cache
 
@@ -707,6 +763,7 @@ class ComfyUI:
         catalog = extracted["catalog"]
         self._merge_scanned_lora_catalog(catalog)
         self._apply_manifest_metadata(catalog)
+        catalog = self._filter_excluded_lora_catalog(catalog)
 
         for entry in catalog.values():
             entry["default_strength"] = self._coerce_lora_strength(entry.get("default_strength"), 1.0)
@@ -878,6 +935,9 @@ class ComfyUI:
                 continue
 
             entry = catalog[matched_key]
+            if self._is_lora_entry_excluded(entry):
+                logger.info(f"[ComfyUI] logically disabled LoRA rejected at execution time: {raw_name}")
+                continue
             strength = self._coerce_lora_strength(item.get("strength"), entry.get("default_strength", 1.0))
             clip_strength = self._coerce_lora_strength(
                 item.get("clip_strength"), entry.get("default_clip_strength", strength)
@@ -980,6 +1040,27 @@ class ComfyUI:
                 tokens.append(f"<lora:{name}:{strength}:{clip_strength}>")
 
         return ", ".join(tokens)
+
+    def _disable_excluded_loras_in_workflow(self, workflow: dict) -> list[str]:
+        disabled = []
+        for _, node_data in self._find_lora_loader_nodes(workflow):
+            inputs = node_data.get("inputs", {})
+            lora_container = inputs.get("loras", {})
+            items = lora_container.get("__value__", [])
+            changed = False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "")).strip()
+                if not name or not self._is_lora_file_excluded(name):
+                    continue
+                item["active"] = False
+                changed = True
+                if name not in disabled:
+                    disabled.append(name)
+            if changed:
+                inputs["text"] = self._rebuild_lora_text(items, active_only=True)
+        return disabled
 
     def _apply_lora_selections(self, workflow: dict, selections: list):
         if not selections:
@@ -1124,6 +1205,10 @@ class ComfyUI:
                     "[ComfyUI] negative node id %s not found in workflow; runtime negative prompt ignored",
                     self.neg_node_id,
                 )
+
+        disabled_loras = self._disable_excluded_loras_in_workflow(workflow)
+        if disabled_loras:
+            logger.info(f"[ComfyUI] disabled LoRA(s) removed from workflow: {', '.join(disabled_loras)}")
 
         if self.lora_control_enabled and lora_selections:
             applied = self._apply_lora_selections(workflow, lora_selections)
