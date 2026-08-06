@@ -528,48 +528,85 @@ class ComfyUIPlugin(Star):
         return cleaned, cleaned != content
 
     @staticmethod
-    def _redact_comfy_tool_call_arguments(entry: dict) -> bool:
-        """从 assistant tool_calls 中脱敏 ComfyUI 绘图参数，同时保留调用结构。"""
-        tool_calls = entry.get("tool_calls")
-        if not isinstance(tool_calls, list):
+    def _remove_comfy_tool_calls_from_history(history: list) -> bool:
+        """移除历史中的 ComfyUI tool-call 及其对应 tool 消息。"""
+        if not isinstance(history, list):
             return False
 
+        removed_tool_call_ids = set()
+        assistant_entries_to_drop = set()
         modified = False
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            function = tool_call.get("function")
-            if not isinstance(function, dict):
-                continue
-            if function.get("name") != "comfyui_txt2img":
+
+        for entry in history:
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
                 continue
 
-            arguments = function.get("arguments")
-            arguments_were_string = isinstance(arguments, str)
-            if arguments_were_string:
-                try:
-                    arguments = json.loads(arguments)
-                except (json.JSONDecodeError, TypeError):
-                    arguments = {}
-                    modified = True
-            elif isinstance(arguments, dict):
-                arguments = copy.deepcopy(arguments)
+            tool_calls = entry.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+
+            kept_tool_calls = []
+            removed_any = False
+            for tool_call in tool_calls:
+                function = tool_call.get("function") if isinstance(tool_call, dict) else None
+                if not isinstance(function, dict) or function.get("name") != "comfyui_txt2img":
+                    kept_tool_calls.append(tool_call)
+                    continue
+
+                removed_any = True
+                tool_call_id = tool_call.get("id")
+                if tool_call_id:
+                    removed_tool_call_ids.add(str(tool_call_id))
+
+            if not removed_any:
+                continue
+
+            modified = True
+            if kept_tool_calls:
+                entry["tool_calls"] = kept_tool_calls
             else:
-                arguments = {}
+                entry.pop("tool_calls", None)
+                if entry.get("content") in (None, "", []):
+                    assistant_entries_to_drop.add(id(entry))
+
+        if not removed_tool_call_ids and not assistant_entries_to_drop:
+            return modified
+
+        filtered_history = []
+        for entry in history:
+            if id(entry) in assistant_entries_to_drop:
+                continue
+            if (
+                isinstance(entry, dict)
+                and entry.get("role") == "tool"
+                and str(entry.get("tool_call_id", "")) in removed_tool_call_ids
+            ):
                 modified = True
+                continue
+            filtered_history.append(entry)
 
-            for key in ("prompt", "text", "negative_prompt"):
-                if key in arguments:
-                    arguments[key] = "[removed by ComfyUI history cleanup]"
-                    modified = True
-
-            function["arguments"] = (
-                json.dumps(arguments, ensure_ascii=False)
-                if arguments_were_string
-                else arguments
-            )
-
+        if len(filtered_history) != len(history):
+            history[:] = filtered_history
+            modified = True
         return modified
+
+    def _clean_history_entries(self, history: list) -> int:
+        """清理历史内容并移除 ComfyUI 工具调用，返回修改的消息数量。"""
+        if not isinstance(history, list):
+            return 0
+
+        cleaned = 0
+        for entry in history:
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            cleaned_content, modified = self._clean_history_content(entry.get("content", ""))
+            if modified:
+                entry["content"] = cleaned_content
+                cleaned += 1
+
+        if self._remove_comfy_tool_calls_from_history(history):
+            cleaned += 1
+        return cleaned
 
     def _clean_pic_tags_from_req(self, req):
         """从请求的 conversation.history 中清理 <pic> 标签"""
@@ -591,18 +628,7 @@ class ComfyUIPlugin(Star):
         if not isinstance(history, list):
             return
 
-        cleaned = 0
-        for entry in history:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("role") != "assistant":
-                continue
-            cleaned_content, modified = self._clean_history_content(entry.get("content", ""))
-            if self._redact_comfy_tool_call_arguments(entry):
-                modified = True
-            if modified:
-                entry["content"] = cleaned_content
-                cleaned += 1
+        cleaned = self._clean_history_entries(history)
 
         if cleaned:
             # 写回 conversation.history
@@ -2792,20 +2818,8 @@ class ComfyUIPlugin(Star):
             except json.JSONDecodeError:
                 return
 
-            modified = False
-            for entry in history:
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("role") != "assistant":
-                    continue
-                cleaned_content, content_modified = self._clean_history_content(
-                    entry.get("content", ""),
-                )
-                if self._redact_comfy_tool_call_arguments(entry):
-                    content_modified = True
-                if content_modified:
-                    entry["content"] = cleaned_content
-                    modified = True
+            cleaned = self._clean_history_entries(history)
+            modified = cleaned > 0
 
             if modified:
                 await conv_mgr.update_conversation(
