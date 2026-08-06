@@ -522,92 +522,6 @@ class ComfyUIPlugin(Star):
             return False
         return True
 
-    def _clean_history_content(self, content):
-        """清理字符串或 AstrBot 结构化 content 中的 ComfyUI 控制内容。"""
-        cleaned = self._sanitize_context_content_for_prompt(content)
-        return cleaned, cleaned != content
-
-    @staticmethod
-    def _remove_comfy_tool_calls_from_history(history: list) -> bool:
-        """移除历史中的 ComfyUI tool-call 及其对应 tool 消息。"""
-        if not isinstance(history, list):
-            return False
-
-        removed_tool_call_ids = set()
-        assistant_entries_to_drop = set()
-        modified = False
-
-        for entry in history:
-            if not isinstance(entry, dict) or entry.get("role") != "assistant":
-                continue
-
-            tool_calls = entry.get("tool_calls")
-            if not isinstance(tool_calls, list):
-                continue
-
-            kept_tool_calls = []
-            removed_any = False
-            for tool_call in tool_calls:
-                function = tool_call.get("function") if isinstance(tool_call, dict) else None
-                if not isinstance(function, dict) or function.get("name") != "comfyui_txt2img":
-                    kept_tool_calls.append(tool_call)
-                    continue
-
-                removed_any = True
-                tool_call_id = tool_call.get("id")
-                if tool_call_id:
-                    removed_tool_call_ids.add(str(tool_call_id))
-
-            if not removed_any:
-                continue
-
-            modified = True
-            if kept_tool_calls:
-                entry["tool_calls"] = kept_tool_calls
-            else:
-                entry.pop("tool_calls", None)
-                if entry.get("content") in (None, "", []):
-                    assistant_entries_to_drop.add(id(entry))
-
-        if not removed_tool_call_ids and not assistant_entries_to_drop:
-            return modified
-
-        filtered_history = []
-        for entry in history:
-            if id(entry) in assistant_entries_to_drop:
-                continue
-            if (
-                isinstance(entry, dict)
-                and entry.get("role") == "tool"
-                and str(entry.get("tool_call_id", "")) in removed_tool_call_ids
-            ):
-                modified = True
-                continue
-            filtered_history.append(entry)
-
-        if len(filtered_history) != len(history):
-            history[:] = filtered_history
-            modified = True
-        return modified
-
-    def _clean_history_entries(self, history: list) -> int:
-        """清理历史内容并移除 ComfyUI 工具调用，返回修改的消息数量。"""
-        if not isinstance(history, list):
-            return 0
-
-        cleaned = 0
-        for entry in history:
-            if not isinstance(entry, dict) or entry.get("role") != "assistant":
-                continue
-            cleaned_content, modified = self._clean_history_content(entry.get("content", ""))
-            if modified:
-                entry["content"] = cleaned_content
-                cleaned += 1
-
-        if self._remove_comfy_tool_calls_from_history(history):
-            cleaned += 1
-        return cleaned
-
     def _clean_pic_tags_from_req(self, req):
         """从请求的 conversation.history 中清理 <pic> 标签"""
         conversation = getattr(req, "conversation", None)
@@ -619,7 +533,6 @@ class ComfyUIPlugin(Star):
         if not history_raw:
             return
 
-        history_was_string = isinstance(history_raw, str)
         try:
             history = json.loads(history_raw) if isinstance(history_raw, str) else history_raw
         except (json.JSONDecodeError, TypeError):
@@ -628,15 +541,22 @@ class ComfyUIPlugin(Star):
         if not isinstance(history, list):
             return
 
-        cleaned = self._clean_history_entries(history)
+        cleaned = 0
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("role") != "assistant":
+                continue
+            content = entry.get("content", "")
+            if isinstance(content, str):
+                stripped = self._strip_comfy_control_tags(content, remove_think=True)
+                if self._find_pic_prompt_matches(content) or "<lora " in content.lower():
+                    entry["content"] = stripped
+                    cleaned += 1
 
         if cleaned:
             # 写回 conversation.history
-            conversation.history = (
-                json.dumps(history, ensure_ascii=False)
-                if history_was_string
-                else history
-            )
+            conversation.history = json.dumps(history, ensure_ascii=False)
             logger.info(f"[ComfyUI] 🗑️ 已从 conversation.history 中清理 {cleaned} 条消息的绘图提示词")
 
     @staticmethod
@@ -2480,6 +2400,7 @@ class ComfyUIPlugin(Star):
 
         cleaned_prompts = [item["prompt"] for item in cleaned_entries]
         use_multi_image_mode = self._should_use_multi_image_mode(len(cleaned_entries))
+        keep_prompt_history = await self._is_prompt_history_keep_active(event)
     
         # 单图模式
         if not use_multi_image_mode:
@@ -2487,7 +2408,7 @@ class ComfyUIPlugin(Star):
             event._comfy_extracted_loras = cleaned_entries[0].get("lora_selections", [])
             logger.info(f"[ComfyUI] 📝 检测到单图模式: {cleaned_prompts[0]}")
             # 丢弃绘图提示词，避免污染历史记录上下文
-            if self.discard_prompt_from_history:
+            if self.discard_prompt_from_history and not keep_prompt_history:
                 resp.completion_text = cleaned_text
                 resp.result_chain = MessageChain().message(cleaned_text)
                 logger.info("[ComfyUI] 🗑️ 已从历史记录中移除绘图提示词")
@@ -2553,7 +2474,7 @@ class ComfyUIPlugin(Star):
                 event._comfy_segments = segments
                 logger.info(f"[ComfyUI] 📝 检测到多图模式，共 {len(cleaned_prompts)} 张图片")
                 # 丢弃绘图提示词，避免污染历史记录上下文
-                if self.discard_prompt_from_history:
+                if self.discard_prompt_from_history and not keep_prompt_history:
                     resp.completion_text = cleaned_text
                     resp.result_chain = MessageChain().message(cleaned_text)
                     logger.info("[ComfyUI] 🗑️ 已从历史记录中移除绘图提示词（多图模式）")            
@@ -2793,11 +2714,7 @@ class ComfyUIPlugin(Star):
             return
 
         # 只在有提取到提示词时才需要清理
-        has_prompt = (
-            hasattr(event, '_comfy_extracted_prompt')
-            or hasattr(event, '_comfy_segments')
-            or bool(event.get_extra("comfy_llm_tool_prompt_used"))
-        )
+        has_prompt = hasattr(event, '_comfy_extracted_prompt') or hasattr(event, '_comfy_segments')
         if not has_prompt:
             return
 
@@ -2818,8 +2735,15 @@ class ComfyUIPlugin(Star):
             except json.JSONDecodeError:
                 return
 
-            cleaned = self._clean_history_entries(history)
-            modified = cleaned > 0
+            modified = False
+            for entry in history:
+                if entry.get("role") != "assistant":
+                    continue
+                content = str(entry.get("content", ""))
+                cleaned = self._strip_comfy_control_tags(content, remove_think=True)
+                if cleaned != content.strip():
+                    entry["content"] = cleaned
+                    modified = True
 
             if modified:
                 await conv_mgr.update_conversation(
@@ -2938,7 +2862,6 @@ class ComfyUIPlugin(Star):
     ) -> MessageEventResult:
         """ComfyUI 文生图工具"""
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
-        is_llm_tool_call = draw_source == "LLM 工具"
         
         # 权限检查
         allowed, reason = self._check_access(event)
@@ -2972,9 +2895,6 @@ class ComfyUIPlugin(Star):
                 self._remember_draw_failure(event, message, source=draw_source)
                 yield message
                 return
-
-        if is_llm_tool_call:
-            event.set_extra("comfy_llm_tool_prompt_used", True)
 
         # API 检查
         if not getattr(self, 'api', None):
@@ -3069,7 +2989,7 @@ class ComfyUIPlugin(Star):
             # 发送结果
             if direct_send:
                 image_component = Image.fromFileSystem(str(img_path))
-                result = event.chain_result([image_component])
+                yield event.chain_result([image_component])
             else:
                 self_id = self._get_self_id(event) or "0"
                 image_component = Image.fromFileSystem(str(img_path))
@@ -3078,13 +2998,7 @@ class ComfyUIPlugin(Star):
                     nickname="ComfyUI",
                     content=[image_component]
                 )
-                result = event.chain_result([forward_node])
-
-            if is_llm_tool_call:
-                await event.send(result)
-                yield "Image generated successfully and sent to the user. Do not call the same tool again for this request."
-            else:
-                yield result
+                yield event.chain_result([forward_node])
 
         except Exception as e:
             logger.error(f"[ComfyUI] 执行异常: {e}")
