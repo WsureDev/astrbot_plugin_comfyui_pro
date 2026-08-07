@@ -2714,7 +2714,11 @@ class ComfyUIPlugin(Star):
             return
 
         # 只在有提取到提示词时才需要清理
-        has_prompt = hasattr(event, '_comfy_extracted_prompt') or hasattr(event, '_comfy_segments')
+        has_prompt = (
+            hasattr(event, '_comfy_extracted_prompt')
+            or hasattr(event, '_comfy_segments')
+            or bool(event.get_extra("comfy_llm_tool_prompt_used"))
+        )
         if not has_prompt:
             return
 
@@ -2862,6 +2866,11 @@ class ComfyUIPlugin(Star):
     ) -> MessageEventResult:
         """ComfyUI 文生图工具"""
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
+        # LLM 调用和用户指令的发送语义不同：LLM 工具必须让 Agent
+        # 继续走完当前回合，AstrBot 才会把本轮上下文（包括工具调用）
+        # 写回 conversation。用户指令则直接把 MessageEventResult 交给
+        # 外层事件流水线即可。
+        is_llm_tool_call = draw_source == "LLM 工具"
         
         # 权限检查
         allowed, reason = self._check_access(event)
@@ -2895,6 +2904,11 @@ class ComfyUIPlugin(Star):
                 self._remember_draw_failure(event, message, source=draw_source)
                 yield message
                 return
+
+        if is_llm_tool_call:
+            # 工具调用可能没有最终的 <pic> 回复，清理阶段仍需要知道
+            # 本轮确实使用过 ComfyUI 工具。
+            event.set_extra("comfy_llm_tool_prompt_used", True)
 
         # API 检查
         if not getattr(self, 'api', None):
@@ -2989,7 +3003,7 @@ class ComfyUIPlugin(Star):
             # 发送结果
             if direct_send:
                 image_component = Image.fromFileSystem(str(img_path))
-                yield event.chain_result([image_component])
+                result = event.chain_result([image_component])
             else:
                 self_id = self._get_self_id(event) or "0"
                 image_component = Image.fromFileSystem(str(img_path))
@@ -2998,7 +3012,20 @@ class ComfyUIPlugin(Star):
                     nickname="ComfyUI",
                     content=[image_component]
                 )
-                yield event.chain_result([forward_node])
+                result = event.chain_result([forward_node])
+
+            if is_llm_tool_call:
+                # 直接发送图片，但返回一个普通工具文本，让 AstrBot 继续
+                # 完成 Agent 回合并可靠地执行 _save_to_history。若返回
+                # MessageEventResult，FunctionToolExecutor 会将其解释为
+                # “工具已直接发送”并提前结束 Agent 回合，历史可能无法落库。
+                await event.send(result)
+                yield (
+                    "Image generated successfully and sent to the user. "
+                    "Do not call the same tool again for this request."
+                )
+            else:
+                yield result
 
         except Exception as e:
             logger.error(f"[ComfyUI] 执行异常: {e}")
