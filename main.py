@@ -86,6 +86,7 @@ class ComfyUIPlugin(Star):
         self.cooldown_seconds = control_conf.get("cooldown_seconds", 60)
         self.user_cooldowns = {}
         self._recent_draw_failures = {}
+        self._background_draw_tasks = set()
         self.admin_user_ids = set(map(str, control_conf.get("admin_ids", [])))
         self.lockdown = bool(control_conf.get("lockdown", False))
         self.lockdown_command_enabled = bool(control_conf.get("lockdown_command_enabled", True))
@@ -2897,6 +2898,145 @@ class ComfyUIPlugin(Star):
         # 清空 chain，防止框架重复发送
         result.chain.clear()
         logger.info(f"[ComfyUI] ✅ 多图模式发送完成")
+
+    def _start_background_draw_task(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self._background_draw_tasks.add(task)
+
+        def finish(completed_task):
+            self._background_draw_tasks.discard(completed_task)
+            try:
+                completed_task.result()
+            except Exception as e:
+                logger.error(f"[ComfyUI] 后台批量绘图任务异常: {e}")
+                logger.error(traceback.format_exc())
+
+        task.add_done_callback(finish)
+
+    async def _collect_submitted_batch_result(self, item: dict) -> dict:
+        if item.get("status") != "submitted":
+            return item
+
+        index = item["index"]
+        try:
+            img_data, error_msg = await self.api.wait_for_result(item["prompt_id"])
+            if not img_data:
+                error_text = str(error_msg or "未知错误")
+                return {
+                    "index": index,
+                    "status": "timeout" if "超时" in error_text else "failed",
+                    "error": error_text,
+                }
+
+            img_filename = f"{uuid.uuid4()}.png"
+            img_path = self.output_dir / img_filename
+            with open(img_path, 'wb') as fp:
+                fp.write(img_data)
+            return {
+                "index": index,
+                "status": "success",
+                "path": img_path,
+                "filename": img_filename,
+            }
+        except Exception as e:
+            logger.error(f"[ComfyUI] 后台批量图片 {index} 处理异常: {e}")
+            return {
+                "index": index,
+                "status": "failed",
+                "error": str(e)[:200],
+            }
+
+    async def _send_llm_batch_results(
+        self,
+        event: AstrMessageEvent,
+        submitted_items: list[dict],
+        direct_send: bool,
+        prompt: str,
+        draw_source: str,
+    ) -> None:
+        def status_text(item: dict) -> str:
+            return "超时" if item["status"] == "timeout" else "生成失败"
+
+        tasks = [
+            asyncio.create_task(self._collect_submitted_batch_result(item))
+            for item in submitted_items
+        ]
+        completed_results = []
+
+        for completed_task in asyncio.as_completed(tasks):
+            item = await completed_task
+            completed_results.append(item)
+            if item["status"] != "success":
+                self._remember_draw_failure(
+                    event,
+                    f"第 {item['index']} 张图片{status_text(item)}：{item['error']}",
+                    prompt=prompt,
+                    source=f"{draw_source} 图片{item['index']}",
+                    append=True,
+                )
+
+            if direct_send:
+                if item["status"] == "success":
+                    result = event.chain_result([
+                        Image.fromFileSystem(str(item["path"])),
+                    ])
+                else:
+                    result = event.plain_result(
+                        f"❌ 第 {item['index']} 张图片{status_text(item)}：{item['error']}"
+                    )
+                try:
+                    await event.send(result)
+                except Exception as e:
+                    logger.error(f"[ComfyUI] 后台批量图片 {item['index']} 发送异常: {e}")
+
+        success_count = sum(1 for item in completed_results if item["status"] == "success")
+        failed_count = sum(1 for item in completed_results if item["status"] == "failed")
+        timeout_count = sum(1 for item in completed_results if item["status"] == "timeout")
+        summary = (
+            f"批量绘图完成：共 {len(completed_results)} 张，成功 {success_count} 张，"
+            f"失败 {failed_count} 张，超时 {timeout_count} 张。"
+        )
+
+        if all(item["status"] == "success" for item in completed_results):
+            self._clear_draw_failures(event)
+
+        if direct_send:
+            try:
+                await event.send(event.plain_result(summary))
+            except Exception as e:
+                logger.error(f"[ComfyUI] 后台批量统计发送异常: {e}")
+            return
+
+        self_id = self._get_self_id(event) or "0"
+        nodes = []
+        for item in sorted(completed_results, key=lambda value: value["index"]):
+            if item["status"] == "success":
+                content = [Image.fromFileSystem(str(item["path"]))]
+            else:
+                content = [
+                    Plain(
+                        f"第 {item['index']} 张图片{status_text(item)}：{item['error']}"
+                    )
+                ]
+            nodes.append(
+                Node(
+                    user_id=int(self_id),
+                    nickname=f"ComfyUI 图片{item['index']}",
+                    content=content,
+                )
+            )
+        nodes.append(
+            Node(
+                user_id=int(self_id),
+                nickname="ComfyUI 统计",
+                content=[Plain(summary)],
+            )
+        )
+        try:
+            await event.send(event.chain_result(nodes))
+        except Exception as e:
+            logger.error(f"[ComfyUI] 后台批量合并消息发送异常: {e}")
+
     @llm_tool(name="comfyui_txt2img")
     async def comfyui_txt2img(
         self,
@@ -3034,6 +3174,56 @@ class ComfyUIPlugin(Star):
             if requested_count > 1:
                 log_message += f" | Count: {requested_count}"
             logger.info(log_message)
+
+            if requested_count > 1 and is_llm_tool_call:
+                async def submit_one(index: int) -> dict:
+                    try:
+                        prompt_id, error_msg = await self.api.submit(
+                            prompt,
+                            lora_selections=lora_selections,
+                            negative_prompt=negative_prompt,
+                        )
+                        if not prompt_id:
+                            return {
+                                "index": index,
+                                "status": "failed",
+                                "error": str(error_msg or "提交 gateway 失败"),
+                            }
+                        return {
+                            "index": index,
+                            "status": "submitted",
+                            "prompt_id": prompt_id,
+                        }
+                    except Exception as e:
+                        return {
+                            "index": index,
+                            "status": "failed",
+                            "error": str(e)[:200],
+                        }
+
+                submitted_items = await asyncio.gather(*[
+                    submit_one(index)
+                    for index in range(1, requested_count + 1)
+                ])
+                accepted_count = sum(
+                    1 for item in submitted_items if item["status"] == "submitted"
+                )
+                rejected_count = requested_count - accepted_count
+                self._start_background_draw_task(
+                    self._send_llm_batch_results(
+                        event,
+                        submitted_items,
+                        direct_send,
+                        prompt,
+                        draw_source,
+                    )
+                )
+                yield (
+                    f"Batch submitted to ComfyUI gateway: requested {requested_count}, "
+                    f"accepted {accepted_count}, rejected {rejected_count}. "
+                    "Results will be sent asynchronously. Do not call the same tool again."
+                )
+                return
 
             if requested_count > 1:
                 async def generate_one(index: int) -> dict:

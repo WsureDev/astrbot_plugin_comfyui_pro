@@ -1340,8 +1340,8 @@ class ComfyUI:
 
         return override_count
 
-    async def generate(self, prompt, lora_selections=None, negative_prompt=None):
-        """Generate an image with the current workflow."""
+    async def submit(self, prompt, lora_selections=None, negative_prompt=None):
+        """Submit a workflow and return its prompt ID without waiting for completion."""
         client_id = str(random.randint(100000, 999999))
         try:
             workflow = self._load_workflow()
@@ -1372,6 +1372,13 @@ class ComfyUI:
             except Exception as e:
                 return None, f"请求报错: {str(e)}"
 
+        if not prompt_id:
+            return None, "ComfyUI 未返回 prompt_id"
+        return str(prompt_id), None
+
+    async def wait_for_result(self, prompt_id):
+        """Wait for a submitted workflow and download its first image output."""
+        async with aiohttp.ClientSession() as session:
             for _ in range(120):
                 await asyncio.sleep(1)
                 try:
@@ -1411,3 +1418,14 @@ class ComfyUI:
                     return None, "工作流执行完成，但未找到输出图片"
 
             return None, "生成超时"
+
+    async def generate(self, prompt, lora_selections=None, negative_prompt=None):
+        """Submit a workflow, wait for completion, and return its first image."""
+        prompt_id, error_msg = await self.submit(
+            prompt,
+            lora_selections=lora_selections,
+            negative_prompt=negative_prompt,
+        )
+        if not prompt_id:
+            return None, error_msg
+        return await self.wait_for_result(prompt_id)
