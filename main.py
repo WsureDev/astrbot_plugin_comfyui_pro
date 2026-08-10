@@ -2902,6 +2902,9 @@ class ComfyUIPlugin(Star):
     def _start_background_draw_task(self, coroutine) -> None:
         task = asyncio.create_task(coroutine)
         self._background_draw_tasks.add(task)
+        logger.info(
+            f"[ComfyUI] 后台批量回收任务已启动，当前后台任务数: {len(self._background_draw_tasks)}"
+        )
 
         def finish(completed_task):
             self._background_draw_tasks.discard(completed_task)
@@ -2918,10 +2921,14 @@ class ComfyUIPlugin(Star):
             return item
 
         index = item["index"]
+        logger.info(
+            f"[ComfyUI] 后台批量图片 {index} 开始回收 | prompt_id: {item['prompt_id']}"
+        )
         try:
             img_data, error_msg = await self.api.wait_for_result(item["prompt_id"])
             if not img_data:
                 error_text = str(error_msg or "未知错误")
+                logger.warning(f"[ComfyUI] 后台批量图片 {index} 回收失败: {error_text}")
                 return {
                     "index": index,
                     "status": "timeout" if "超时" in error_text else "failed",
@@ -2932,6 +2939,7 @@ class ComfyUIPlugin(Star):
             img_path = self.output_dir / img_filename
             with open(img_path, 'wb') as fp:
                 fp.write(img_data)
+            logger.info(f"[ComfyUI] 后台批量图片 {index} 回收成功: {img_filename}")
             return {
                 "index": index,
                 "status": "success",
@@ -2977,15 +2985,17 @@ class ComfyUIPlugin(Star):
 
             if direct_send:
                 if item["status"] == "success":
-                    result = event.chain_result([
+                    result = MessageChain([
                         Image.fromFileSystem(str(item["path"])),
                     ])
                 else:
-                    result = event.plain_result(
+                    result = MessageChain().message(
                         f"❌ 第 {item['index']} 张图片{status_text(item)}：{item['error']}"
                     )
                 try:
+                    logger.info(f"[ComfyUI] 后台批量图片 {item['index']} 开始发送")
                     await self.context.send_message(event.unified_msg_origin, result)
+                    logger.info(f"[ComfyUI] 后台批量图片 {item['index']} 发送完成")
                 except Exception as e:
                     logger.error(f"[ComfyUI] 后台批量图片 {item['index']} 发送异常: {e}")
 
@@ -3002,10 +3012,12 @@ class ComfyUIPlugin(Star):
 
         if direct_send:
             try:
+                logger.info("[ComfyUI] 后台批量统计开始发送")
                 await self.context.send_message(
                     event.unified_msg_origin,
-                    event.plain_result(summary),
+                    MessageChain().message(summary),
                 )
+                logger.info("[ComfyUI] 后台批量统计发送完成")
             except Exception as e:
                 logger.error(f"[ComfyUI] 后台批量统计发送异常: {e}")
             return
@@ -3036,10 +3048,12 @@ class ComfyUIPlugin(Star):
             )
         )
         try:
+            logger.info("[ComfyUI] 后台批量合并消息开始发送")
             await self.context.send_message(
                 event.unified_msg_origin,
-                event.chain_result(nodes),
+                MessageChain(nodes),
             )
+            logger.info("[ComfyUI] 后台批量合并消息发送完成")
         except Exception as e:
             logger.error(f"[ComfyUI] 后台批量合并消息发送异常: {e}")
 
@@ -3223,6 +3237,9 @@ class ComfyUIPlugin(Star):
                         prompt,
                         draw_source,
                     )
+                )
+                logger.info(
+                    f"[ComfyUI] gateway 批量提交完成，后台回收已接管 {accepted_count} 个任务"
                 )
                 yield (
                     f"Batch submitted to ComfyUI gateway: requested {requested_count}, "
