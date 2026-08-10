@@ -41,10 +41,16 @@ class _ComfyImageMarker:
 class ComfyUIPlugin(Star):
     _FORCE_DRAW_CONTEXT_LIMIT = 12
     _FORCE_DRAW_MIN_REPLY_LENGTH = 100
+    _MAX_REPEATED_IMAGES_PER_REQUEST = 16
+    _REPEATED_IMAGE_TIMEOUT_SECONDS = 330
     _DRAW_FAILURE_CONTEXT_TTL_SECONDS = 600
     _DRAW_FAILURE_CONTEXT_LIMIT = 5
     _DRAW_NEGATIVE_SPLIT_PATTERN = re.compile(
         r"\s+--(?:neg|negative)\b",
+        flags=re.IGNORECASE,
+    )
+    _DRAW_COUNT_PATTERN = re.compile(
+        r"(?<!\S)-c(?:\s*=\s*|\s+)(?P<count>\S+)",
         flags=re.IGNORECASE,
     )
     _PIC_PROMPT_TAG_PATTERN = re.compile(
@@ -335,25 +341,38 @@ class ComfyUIPlugin(Star):
         return text[:limit] + ("..." if len(text) > limit else "")
 
     @classmethod
-    def _parse_draw_command_payload(cls, raw_message: str) -> tuple[str, str | None]:
+    def _parse_draw_command_payload(cls, raw_message: str) -> tuple[str, str | None, int | None]:
         full_message = str(raw_message or "").strip()
         parts = full_message.split(None, 1)
         arg_text = parts[1].strip() if len(parts) > 1 else ""
         if not arg_text:
-            return "", None
+            return "", None, None
+
+        count = None
+        count_match = cls._DRAW_COUNT_PATTERN.search(arg_text)
+        if count_match:
+            raw_count = count_match.group("count")
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                raise ValueError("❌ 图片数量必须是正整数，例如：-c 4") from None
+            arg_text = f"{arg_text[:count_match.start()]} {arg_text[count_match.end():]}".strip()
 
         match = cls._DRAW_NEGATIVE_SPLIT_PATTERN.search(arg_text)
         if not match:
-            return arg_text, None
+            return arg_text, None, count
 
         prompt = arg_text[:match.start()].strip()
         negative_prompt = arg_text[match.end():].strip()
         negative_prompt = re.sub(r"^(=|:|：)\s*", "", negative_prompt).strip()
-        return prompt, negative_prompt or None
+        return prompt, negative_prompt or None, count
 
     def _extract_command_prompt(self, event: AstrMessageEvent) -> str:
         full_message = (getattr(event, "message_str", "") or "").strip()
-        prompt, _ = self._parse_draw_command_payload(full_message)
+        try:
+            prompt, _, _ = self._parse_draw_command_payload(full_message)
+        except ValueError:
+            return full_message
         return prompt
 
     def _remember_draw_failure(
@@ -1170,12 +1189,18 @@ class ComfyUIPlugin(Star):
         
         try:
             full_message = event.message_str.strip()
-            prompt, negative_prompt = self._parse_draw_command_payload(full_message)
+            try:
+                prompt, negative_prompt, requested_count = self._parse_draw_command_payload(full_message)
+            except ValueError as e:
+                message = str(e)
+                self._remember_draw_failure(event, message, source="用户指令")
+                yield event.plain_result(message)
+                return
 
             if not prompt:
                 message = (
                     "❌ 请输入提示词，例如：/画图 1girl, smile\n"
-                    "可选负面词：/画图 1girl, smile --neg lowres, bad hands"
+                    "可选参数：--neg lowres, bad hands -c 4"
                 )
                 self._remember_draw_failure(event, message, source="用户指令")
                 yield event.plain_result(message)
@@ -1202,6 +1227,7 @@ class ComfyUIPlugin(Star):
                 event,
                 prompt=prompt,
                 negative_prompt=negative_prompt,
+                count=requested_count,
                 direct_send=direct_send,
             ):
                 if isinstance(result, str):
@@ -1259,9 +1285,9 @@ class ComfyUIPlugin(Star):
             "━━━━━━━━━━━━━━━━━━",
             "",
             "【基础指令】",
-            "  /画图 <提示词> [--neg <负面词>]     生成图片（转发模式）",
-            "  /画图no <提示词> [--neg <负面词>]   生成图片（直发模式）",
-            "  /重绘 <提示词> [--neg <负面词>]     直接重绘",
+            "  /画图 <提示词> [-c <数量>] [--neg <负面词>]     生成图片（转发模式）",
+            "  /画图no <提示词> [-c <数量>] [--neg <负面词>]   生成图片（直发模式）",
+            "  /重绘 <提示词> [-c <数量>] [--neg <负面词>]     直接重绘",
             "  /comfy帮助         显示此帮助",
             "",
             "【LLM 模式】",
@@ -2247,11 +2273,15 @@ class ComfyUIPlugin(Star):
     async def cmd_reroll(self, event: AstrMessageEvent):
         full_msg = (event.message_str or "").strip()
         full_msg = re.sub(r'\[At:\d+\]\s*', '', full_msg).strip()
-        prompt, _ = self._parse_draw_command_payload(full_msg)
+        try:
+            prompt, _, _ = self._parse_draw_command_payload(full_msg)
+        except ValueError as e:
+            yield event.plain_result(str(e))
+            return
         if not prompt:
             yield event.plain_result(
-                "📖 用法: /重绘 <提示词> [--neg <负面词>]\n"
-                "示例: /重绘 1girl, silver hair, cinematic lighting --neg lowres, bad hands"
+                "📖 用法: /重绘 <提示词> [-c <数量>] [--neg <负面词>]\n"
+                "示例: /重绘 1girl, silver hair, cinematic lighting -c 3 --neg lowres, bad hands"
             )
             return
         async for result in self._handle_paint_logic(event, direct_send=True):
@@ -2379,6 +2409,9 @@ class ComfyUIPlugin(Star):
     @filter.on_llm_response(priority=70)
     async def _extract_prompt_before_filter(self, event: AstrMessageEvent, resp: LLMResponse):
         """提取 LLM 回复中的提示词（使用 <pic prompt="..."> 格式）"""
+        if event.get_extra("comfy_llm_tool_prompt_used"):
+            logger.info("[ComfyUI] 本轮已使用绘图工具，跳过 <pic prompt> 自动绘图")
+            return
         if not resp or not resp.completion_text:
             return
     
@@ -2483,7 +2516,10 @@ class ComfyUIPlugin(Star):
     @filter.on_decorating_result(priority=99)
     async def _auto_paint_from_llm(self, event: AstrMessageEvent):
         """自动绘图 - 阶段1：构建 chain（多图）或启动异步任务（单图）"""
-        if getattr(event, "_comfy_auto_painted", False):
+        if (
+            getattr(event, "_comfy_auto_painted", False)
+            or event.get_extra("comfy_llm_tool_prompt_used")
+        ):
             return
 
         # 检查是否有多图段落
@@ -2789,6 +2825,17 @@ class ComfyUIPlugin(Star):
 
         self._clear_draw_failures(event)
 
+        async def generate_marker(marker):
+            logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt}")
+            return await self.api.generate(
+                marker.prompt,
+                lora_selections=marker.lora_selections,
+            )
+
+        markers = [group["marker"] for group in groups if group["marker"]]
+        generation_tasks = [asyncio.create_task(generate_marker(marker)) for marker in markers]
+        generation_index = 0
+
         # 逐组发送
         for group in groups:
             items = group["items"]
@@ -2808,11 +2855,9 @@ class ComfyUIPlugin(Star):
             # 生成并发送图片
             if marker:
                 try:
-                    logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt}")
-                    img_data, error_msg = await self.api.generate(
-                        marker.prompt,
-                        lora_selections=marker.lora_selections,
-                    )
+                    generation_task = generation_tasks[generation_index]
+                    generation_index += 1
+                    img_data, error_msg = await generation_task
 
                     if not img_data:
                         message = f"❌ [图片{marker.index}] 生成失败：{error_msg}"
@@ -2862,9 +2907,10 @@ class ComfyUIPlugin(Star):
         negative_prompt: str = None,
         img_width: int = None,
         img_height: int = None,
+        count: int = 1,
         direct_send: bool = False,
     ) -> MessageEventResult:
-        """ComfyUI 文生图工具"""
+        """ComfyUI 文生图工具；count>1 时对同一 prompt 并发生成多张图片。"""
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         # LLM 调用和用户指令的发送语义不同：LLM 工具必须让 Agent
         # 继续走完当前回合，AstrBot 才会把本轮上下文（包括工具调用）
@@ -2904,6 +2950,21 @@ class ComfyUIPlugin(Star):
                 self._remember_draw_failure(event, message, source=draw_source)
                 yield message
                 return
+
+        try:
+            requested_count = int(count or 1)
+        except (TypeError, ValueError):
+            message = "❌ 图片数量必须是正整数"
+            self._remember_draw_failure(event, message, prompt=prompt, source=draw_source)
+            yield message
+            return
+        if requested_count < 1 or requested_count > self._MAX_REPEATED_IMAGES_PER_REQUEST:
+            message = (
+                f"❌ 图片数量必须在 1-{self._MAX_REPEATED_IMAGES_PER_REQUEST} 之间"
+            )
+            self._remember_draw_failure(event, message, prompt=prompt, source=draw_source)
+            yield message
+            return
 
         if is_llm_tool_call:
             # 工具调用可能没有最终的 <pic> 回复，清理阶段仍需要知道
@@ -2970,7 +3031,144 @@ class ComfyUIPlugin(Star):
             log_message = f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt}"
             if negative_prompt:
                 log_message += f" | Negative: {negative_prompt}"
+            if requested_count > 1:
+                log_message += f" | Count: {requested_count}"
             logger.info(log_message)
+
+            if requested_count > 1:
+                async def generate_one(index: int) -> dict:
+                    try:
+                        img_data, error_msg = await asyncio.wait_for(
+                            self.api.generate(
+                                prompt,
+                                lora_selections=lora_selections,
+                                negative_prompt=negative_prompt,
+                            ),
+                            timeout=self._REPEATED_IMAGE_TIMEOUT_SECONDS,
+                        )
+                        if not img_data:
+                            error_text = str(error_msg or "未知错误")
+                            return {
+                                "index": index,
+                                "status": "timeout" if "超时" in error_text else "failed",
+                                "error": error_text,
+                            }
+
+                        img_filename = f"{uuid.uuid4()}.png"
+                        img_path = self.output_dir / img_filename
+                        with open(img_path, 'wb') as fp:
+                            fp.write(img_data)
+                        return {
+                            "index": index,
+                            "status": "success",
+                            "path": img_path,
+                            "filename": img_filename,
+                        }
+                    except asyncio.TimeoutError:
+                        return {
+                            "index": index,
+                            "status": "timeout",
+                            "error": "超过批量子任务等待时间",
+                        }
+                    except Exception as e:
+                        logger.error(f"[ComfyUI] 批量图片 {index} 处理异常: {e}")
+                        return {
+                            "index": index,
+                            "status": "failed",
+                            "error": str(e)[:200],
+                        }
+
+                tasks = [
+                    asyncio.create_task(generate_one(index))
+                    for index in range(1, requested_count + 1)
+                ]
+                completed_results = []
+
+                def result_status_text(item: dict) -> str:
+                    return "超时" if item["status"] == "timeout" else "生成失败"
+
+                async def send_single_result(item: dict) -> None:
+                    index = item["index"]
+                    if item["status"] == "success":
+                        result = event.chain_result([
+                            Image.fromFileSystem(str(item["path"])),
+                        ])
+                    else:
+                        result = event.plain_result(
+                            f"❌ 第 {index} 张图片{result_status_text(item)}：{item['error']}"
+                        )
+
+                    if is_llm_tool_call:
+                        await event.send(result)
+                    else:
+                        item["message"] = result
+
+                for completed_task in asyncio.as_completed(tasks):
+                    item = await completed_task
+                    completed_results.append(item)
+                    if item["status"] != "success":
+                        self._remember_draw_failure(
+                            event,
+                            f"第 {item['index']} 张图片{result_status_text(item)}：{item['error']}",
+                            prompt=prompt,
+                            source=f"{draw_source} 图片{item['index']}",
+                            append=True,
+                        )
+                    if direct_send:
+                        try:
+                            await send_single_result(item)
+                        except Exception as e:
+                            logger.error(
+                                f"[ComfyUI] 批量图片 {item['index']} 发送异常: {e}"
+                            )
+                        if not is_llm_tool_call:
+                            yield item["message"]
+
+                if all(item["status"] == "success" for item in completed_results):
+                    self._clear_draw_failures(event)
+
+                if not direct_send:
+                    self_id = self._get_self_id(event) or "0"
+                    nodes = []
+                    for item in sorted(completed_results, key=lambda value: value["index"]):
+                        if item["status"] == "success":
+                            content = [Image.fromFileSystem(str(item["path"]))]
+                        else:
+                            content = [
+                                Plain(
+                                    f"第 {item['index']} 张图片{result_status_text(item)}：{item['error']}"
+                                )
+                            ]
+                        nodes.append(
+                            Node(
+                                user_id=int(self_id),
+                                nickname=f"ComfyUI 图片{item['index']}",
+                                content=content,
+                            )
+                        )
+
+                    merged_result = event.chain_result(nodes)
+                    if is_llm_tool_call:
+                        await event.send(merged_result)
+                    else:
+                        yield merged_result
+
+                if is_llm_tool_call:
+                    success_count = sum(
+                        1 for item in completed_results if item["status"] == "success"
+                    )
+                    failed_count = sum(
+                        1 for item in completed_results if item["status"] == "failed"
+                    )
+                    timeout_count = sum(
+                        1 for item in completed_results if item["status"] == "timeout"
+                    )
+                    yield (
+                        f"Batch generation completed: requested {requested_count}, "
+                        f"succeeded {success_count}, failed {failed_count}, "
+                        f"timed out {timeout_count}."
+                    )
+                return
 
             # 调用 API
             img_data, error_msg = await self.api.generate(
