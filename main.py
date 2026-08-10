@@ -2985,7 +2985,7 @@ class ComfyUIPlugin(Star):
                         f"❌ 第 {item['index']} 张图片{status_text(item)}：{item['error']}"
                     )
                 try:
-                    await event.send(result)
+                    await self.context.send_message(event.unified_msg_origin, result)
                 except Exception as e:
                     logger.error(f"[ComfyUI] 后台批量图片 {item['index']} 发送异常: {e}")
 
@@ -3002,7 +3002,10 @@ class ComfyUIPlugin(Star):
 
         if direct_send:
             try:
-                await event.send(event.plain_result(summary))
+                await self.context.send_message(
+                    event.unified_msg_origin,
+                    event.plain_result(summary),
+                )
             except Exception as e:
                 logger.error(f"[ComfyUI] 后台批量统计发送异常: {e}")
             return
@@ -3033,7 +3036,10 @@ class ComfyUIPlugin(Star):
             )
         )
         try:
-            await event.send(event.chain_result(nodes))
+            await self.context.send_message(
+                event.unified_msg_origin,
+                event.chain_result(nodes),
+            )
         except Exception as e:
             logger.error(f"[ComfyUI] 后台批量合并消息发送异常: {e}")
 
