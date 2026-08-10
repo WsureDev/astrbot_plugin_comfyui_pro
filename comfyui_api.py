@@ -1372,7 +1372,7 @@ class ComfyUI:
             except Exception as e:
                 return None, f"请求报错: {str(e)}"
 
-            for _ in range(300):
+            for _ in range(120):
                 await asyncio.sleep(1)
                 try:
                     async with session.get(f"{self.url}/history/{prompt_id}") as h_resp:
