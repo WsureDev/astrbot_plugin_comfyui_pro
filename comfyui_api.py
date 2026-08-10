@@ -1376,11 +1376,13 @@ class ComfyUI:
             return None, "ComfyUI 未返回 prompt_id"
         return str(prompt_id), None
 
-    async def wait_for_result(self, prompt_id):
+    async def wait_for_result(self, prompt_id, timeout_seconds=120):
         """Wait for a submitted workflow and download its first image output."""
         async with aiohttp.ClientSession() as session:
-            for _ in range(120):
+            polls = 0
+            while timeout_seconds is None or polls < timeout_seconds:
                 await asyncio.sleep(1)
+                polls += 1
                 try:
                     async with session.get(f"{self.url}/history/{prompt_id}") as h_resp:
                         if h_resp.status != 200:
@@ -1416,7 +1418,6 @@ class ComfyUI:
                             return None, "下载图片失败"
 
                     return None, "工作流执行完成，但未找到输出图片"
-
             return None, "生成超时"
 
     async def generate(self, prompt, lora_selections=None, negative_prompt=None):
