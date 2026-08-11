@@ -3129,7 +3129,7 @@ class ComfyUIPlugin(Star):
                     content=[Plain(summary)],
                 )
             )
-            await event.send(MessageChain(nodes))
+            await event.send(MessageChain([Nodes(nodes)]))
 
         logger.info(f"[ComfyUI] wait stage 结束 | {summary}")
 
@@ -3421,7 +3421,7 @@ class ComfyUIPlugin(Star):
                         )
                     )
 
-                    merged_result = event.chain_result(nodes)
+                    merged_result = event.chain_result([Nodes(nodes)])
                     if is_llm_tool_call:
                         await event.send(merged_result)
                     else:
