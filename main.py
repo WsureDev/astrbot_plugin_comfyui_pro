@@ -2842,25 +2842,39 @@ class ComfyUIPlugin(Star):
 
         self._clear_draw_failures(event)
 
-        async def generate_marker(marker):
-            logger.info(f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 开始生成: {marker.prompt}")
-            return await self.api.generate(
-                marker.prompt,
-                lora_selections=marker.lora_selections,
+        async def submit_group(group: dict) -> tuple[dict, dict]:
+            marker = group["marker"]
+            logger.info(
+                f"[ComfyUI] 🎨 [{marker.index}/{prompt_count}] 提交生成: {marker.prompt}"
             )
+            try:
+                prompt_id, error_msg = await self.api.submit(
+                    marker.prompt,
+                    lora_selections=marker.lora_selections,
+                )
+                if not prompt_id:
+                    return group, {
+                        "index": marker.index,
+                        "status": "failed",
+                        "error": str(error_msg or "提交 gateway 失败"),
+                    }
+                return group, {
+                    "index": marker.index,
+                    "status": "submitted",
+                    "prompt_id": prompt_id,
+                }
+            except Exception as e:
+                return group, {
+                    "index": marker.index,
+                    "status": "failed",
+                    "error": str(e)[:200],
+                }
 
-        markers = [group["marker"] for group in groups if group["marker"]]
-        generation_tasks = [asyncio.create_task(generate_marker(marker)) for marker in markers]
-        generation_index = 0
-
-        # 逐组发送
-        for group in groups:
+        async def send_group(group: dict, item: dict) -> None:
             items = group["items"]
             marker = group["marker"]
 
-            # 发送本组的渲染内容（文字/图片）
             if items:
-                # 过滤空 Plain
                 filtered = [it for it in items if not (isinstance(it, Plain) and not it.text.strip())]
                 if filtered:
                     try:
@@ -2869,47 +2883,89 @@ class ComfyUIPlugin(Star):
                     except Exception as e:
                         logger.error(f"[ComfyUI] 发送文字段失败: {e}")
 
-            # 生成并发送图片
-            if marker:
+            if item["status"] != "success":
+                label = "超时" if item["status"] == "timeout" else "生成失败"
+                message = f"❌ [图片{marker.index}] {label}：{item['error']}"
+                logger.error(f"[ComfyUI] 图片 {marker.index} {label}: {item['error']}")
+                self._remember_draw_failure(
+                    event,
+                    message,
+                    prompt=marker.prompt,
+                    source=f"LLM 多图 图片{marker.index}",
+                    append=True,
+                )
                 try:
-                    generation_task = generation_tasks[generation_index]
-                    generation_index += 1
-                    img_data, error_msg = await generation_task
+                    await event.send(event.plain_result(message))
+                except Exception:
+                    pass
+                return
 
-                    if not img_data:
-                        message = f"❌ [图片{marker.index}] 生成失败：{error_msg}"
-                        logger.error(f"[ComfyUI] 图片 {marker.index} 生成失败: {error_msg}")
-                        self._remember_draw_failure(
-                            event,
-                            message,
-                            prompt=marker.prompt,
-                            source=f"LLM 多图 图片{marker.index}",
-                            append=True,
-                        )
-                        try:
-                            await event.send(event.plain_result(message))
-                        except:
-                            pass
-                        continue
+            await event.send(
+                event.chain_result([Image.fromFileSystem(str(item["path"]))])
+            )
+            logger.info(
+                f"[ComfyUI] ✅ [{marker.index}/{prompt_count}] 图片已发送: {item['filename']}"
+            )
 
-                    img_filename = f"{uuid.uuid4()}.png"
-                    img_path = self.output_dir / img_filename
-                    with open(img_path, 'wb') as fp:
-                        fp.write(img_data)
+        marker_groups = [group for group in groups if group["marker"]]
+        trailing_groups = [group for group in groups if not group["marker"]]
+        submitted_pairs = await asyncio.gather(*[
+            submit_group(group)
+            for group in marker_groups
+        ])
+        task_groups = {}
+        for group, item in submitted_pairs:
+            task = asyncio.create_task(
+                self._collect_submitted_batch_result(item, timeout_seconds=None)
+            )
+            task_groups[task] = group
 
-                    await event.send(event.chain_result([Image.fromFileSystem(str(img_path))]))
-                    logger.info(f"[ComfyUI] ✅ [{marker.index}/{prompt_count}] 图片已发送: {img_filename}")
-
-                except Exception as e:
-                    logger.error(f"[ComfyUI] 图片 {marker.index} 处理异常: {e}")
-                    logger.error(traceback.format_exc())
-                    self._remember_draw_failure(
-                        event,
-                        f"❌ [图片{marker.index}] 处理异常：{str(e)[:50]}",
-                        prompt=marker.prompt,
-                        source=f"LLM 多图 图片{marker.index}",
-                        append=True,
+        pending = set(task_groups)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=self._BATCH_WAIT_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                timed_out_tasks = list(pending)
+                pending.clear()
+                for task in timed_out_tasks:
+                    group = task_groups[task]
+                    marker = group["marker"]
+                    task.cancel()
+                    await send_group(
+                        group,
+                        {
+                            "index": marker.index,
+                            "status": "timeout",
+                            "error": (
+                                f"连续 {self._BATCH_WAIT_TIMEOUT_SECONDS} 秒"
+                                "没有收到新的图片结果"
+                            ),
+                        },
                     )
+                await asyncio.gather(*timed_out_tasks, return_exceptions=True)
+                logger.warning(
+                    f"[ComfyUI] 多 prompt 批次滑动超时，剩余 {len(timed_out_tasks)} 个任务"
+                )
+                break
+
+            logger.info(
+                f"[ComfyUI] 多 prompt 批次收到 {len(done)} 个终态结果，"
+                f"重置 {self._BATCH_WAIT_TIMEOUT_SECONDS} 秒等待窗口"
+            )
+            for task in done:
+                await send_group(task_groups[task], await task)
+
+        for group in trailing_groups:
+            items = group["items"]
+            filtered = [it for it in items if not (isinstance(it, Plain) and not it.text.strip())]
+            if filtered:
+                try:
+                    await event.send(event.chain_result(filtered))
+                except Exception as e:
+                    logger.error(f"[ComfyUI] 发送末尾文字段失败: {e}")
 
         # 清空 chain，防止框架重复发送
         result.chain.clear()
