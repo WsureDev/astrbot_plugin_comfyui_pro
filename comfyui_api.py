@@ -481,8 +481,40 @@ class ComfyUI:
 
         return base
 
-    def _get_lora_manifest_path(self) -> Path:
-        return self.workflow_path.parent / f"{self.workflow_path.stem}{LORA_MANIFEST_SUFFIX}"
+    def _resolve_workflow_path(self, workflow_filename: str = None) -> tuple[Path, str]:
+        selector = str(workflow_filename or "").strip()
+        if not selector:
+            return self.workflow_path, self.wf_filename
+
+        selector_path = Path(selector)
+        if selector_path.name != selector or selector_path.suffix.lower() not in ("", ".json"):
+            raise ValueError(f"无效的工作流名称: {selector}")
+
+        candidates = []
+        selector_key = selector.casefold()
+        selector_stem_key = selector_path.stem.casefold()
+        for path in self.workflow_dir.glob("*.json"):
+            name = path.name
+            if name.endswith((".steps.json", LORA_MANIFEST_SUFFIX, ".profile.json")):
+                continue
+            if name.casefold() == selector_key or path.stem.casefold() == selector_stem_key:
+                candidates.append(path)
+
+        if not candidates:
+            raise FileNotFoundError(f"工作流不存在: {selector}")
+        if len(candidates) > 1:
+            names = ", ".join(sorted(path.name for path in candidates))
+            raise ValueError(f"工作流名称不明确: {selector}，匹配到: {names}")
+
+        path = candidates[0]
+        return path, path.name
+
+    def resolve_workflow_filename(self, workflow_filename: str = None) -> str:
+        return self._resolve_workflow_path(workflow_filename)[1]
+
+    def _get_lora_manifest_path(self, workflow_filename: str = None) -> Path:
+        workflow_path, _ = self._resolve_workflow_path(workflow_filename)
+        return workflow_path.parent / f"{workflow_path.stem}{LORA_MANIFEST_SUFFIX}"
 
     def _find_lora_loader_nodes(self, workflow: dict):
         nodes = []
@@ -537,8 +569,8 @@ class ComfyUI:
 
         return {"catalog": catalog, "loader_node_ids": loader_node_ids}
 
-    def _load_lora_manifest(self) -> dict:
-        path = self._get_lora_manifest_path()
+    def _load_lora_manifest(self, workflow_filename: str = None) -> dict:
+        path = self._get_lora_manifest_path(workflow_filename)
         if not path.exists():
             return {}
 
@@ -675,8 +707,8 @@ class ComfyUI:
 
         return catalog
 
-    def _apply_manifest_metadata(self, catalog: dict):
-        manifest = self._load_lora_manifest()
+    def _apply_manifest_metadata(self, catalog: dict, workflow_filename: str = None):
+        manifest = self._load_lora_manifest(workflow_filename)
         if not manifest:
             return catalog
 
@@ -735,9 +767,20 @@ class ComfyUI:
 
         return catalog
 
-    def get_lora_runtime_context(self) -> dict:
+    def get_lora_runtime_context(self, workflow_filename: str = None) -> dict:
+        try:
+            workflow_path, resolved_filename = self._resolve_workflow_path(workflow_filename)
+        except Exception as e:
+            logger.warning(f"[ComfyUI] failed to resolve workflow for LoRA context: {e}")
+            return {
+                "supported": False,
+                "catalog": {},
+                "loader_node_ids": [],
+                "manifest_path": "",
+            }
+
         cache_key = (
-            str(self.workflow_path),
+            str(workflow_path),
             tuple(str(path) for path in self.lora_scan_roots),
         )
         now = time.monotonic()
@@ -749,20 +792,20 @@ class ComfyUI:
             return self._lora_context_cache
 
         try:
-            workflow = self._load_workflow()
+            workflow = self._load_workflow(resolved_filename)
         except Exception as e:
             logger.warning(f"[ComfyUI] failed to read workflow for LoRA context: {e}")
             return {
                 "supported": False,
                 "catalog": {},
                 "loader_node_ids": [],
-                "manifest_path": str(self._get_lora_manifest_path()),
+                "manifest_path": str(self._get_lora_manifest_path(resolved_filename)),
             }
 
         extracted = self._extract_lora_catalog(workflow)
         catalog = extracted["catalog"]
         self._merge_scanned_lora_catalog(catalog)
-        self._apply_manifest_metadata(catalog)
+        self._apply_manifest_metadata(catalog, resolved_filename)
         catalog = self._filter_excluded_lora_catalog(catalog)
 
         for entry in catalog.values():
@@ -785,7 +828,7 @@ class ComfyUI:
             "supported": bool(extracted["loader_node_ids"]),
             "catalog": sorted_catalog,
             "loader_node_ids": extracted["loader_node_ids"],
-            "manifest_path": str(self._get_lora_manifest_path()),
+            "manifest_path": str(self._get_lora_manifest_path(resolved_filename)),
             "scan_roots": [str(path) for path in self.lora_scan_roots],
             "default_active_loras": default_active_loras,
         }
@@ -900,11 +943,11 @@ class ComfyUI:
 
         return "\n".join(lines).strip()
 
-    def resolve_lora_selections(self, selections) -> list:
+    def resolve_lora_selections(self, selections, workflow_filename: str = None) -> list:
         if not selections:
             return []
 
-        context = self.get_lora_runtime_context()
+        context = self.get_lora_runtime_context(workflow_filename)
         catalog = context.get("catalog", {})
         if not context.get("supported") or not catalog:
             return []
@@ -1143,13 +1186,21 @@ class ComfyUI:
 
         return applied
 
-    def _load_workflow(self):
-        if not self.workflow_path.exists():
-            raise FileNotFoundError(f"工作流文件不存在: {self.workflow_path}")
-        with open(self.workflow_path, "r", encoding="utf-8") as f:
+    def _load_workflow(self, workflow_filename: str = None):
+        workflow_path, _ = self._resolve_workflow_path(workflow_filename)
+        if not workflow_path.exists():
+            raise FileNotFoundError(f"工作流文件不存在: {workflow_path}")
+        with open(workflow_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _inject_params(self, workflow, prompt, lora_selections=None, negative_prompt=None):
+    def _inject_params(
+        self,
+        workflow,
+        prompt,
+        lora_selections=None,
+        negative_prompt=None,
+        workflow_filename: str = None,
+    ):
         """Inject prompts, optional LoRA selections, steps overrides, and seeds into workflow."""
         node = workflow.get(self.input_id)
         if not node:
@@ -1217,7 +1268,7 @@ class ComfyUI:
             else:
                 logger.info("[ComfyUI] LoRA selections detected, but no compatible LoRA stack node was found")
 
-        overrides = self._load_steps_override()
+        overrides = self._load_steps_override(workflow_filename)
         if overrides:
             count = self._apply_steps_override(workflow, overrides)
             if count > 0:
@@ -1256,11 +1307,11 @@ class ComfyUI:
             f"[ComfyUI] base seed: {base_seed}, updated {ks_count} seed/noise_seed inputs"
         )
 
-    def _load_steps_override(self) -> dict:
+    def _load_steps_override(self, workflow_filename: str = None) -> dict:
         """Load steps override sidecar for the current workflow."""
         try:
-            stem = self.workflow_path.stem
-            sidecar = self.workflow_path.parent / f"{stem}.steps.json"
+            workflow_path, _ = self._resolve_workflow_path(workflow_filename)
+            sidecar = workflow_path.parent / f"{workflow_path.stem}.steps.json"
 
             if not sidecar.exists():
                 return {}
@@ -1340,15 +1391,26 @@ class ComfyUI:
 
         return override_count
 
-    async def submit(self, prompt, lora_selections=None, negative_prompt=None):
+    async def submit(
+        self,
+        prompt,
+        lora_selections=None,
+        negative_prompt=None,
+        workflow_filename: str = None,
+    ):
         """Submit a workflow and return its prompt ID without waiting for completion."""
         client_id = str(random.randint(100000, 999999))
         try:
-            workflow = self._load_workflow()
+            _, resolved_filename = self._resolve_workflow_path(workflow_filename)
+            workflow = self._load_workflow(resolved_filename)
         except Exception as e:
             return None, str(e)
 
-        resolved_loras = self.resolve_lora_selections(lora_selections) if self.lora_control_enabled else []
+        resolved_loras = (
+            self.resolve_lora_selections(lora_selections, resolved_filename)
+            if self.lora_control_enabled
+            else []
+        )
         prompt, injected_hints = self._inject_selected_lora_prompt_hints(str(prompt or ""), resolved_loras)
 
         if injected_hints:
@@ -1359,6 +1421,7 @@ class ComfyUI:
             prompt,
             resolved_loras,
             negative_prompt=negative_prompt,
+            workflow_filename=resolved_filename,
         )
 
         async with aiohttp.ClientSession() as session:
@@ -1420,12 +1483,19 @@ class ComfyUI:
                     return None, "工作流执行完成，但未找到输出图片"
             return None, "生成超时"
 
-    async def generate(self, prompt, lora_selections=None, negative_prompt=None):
+    async def generate(
+        self,
+        prompt,
+        lora_selections=None,
+        negative_prompt=None,
+        workflow_filename: str = None,
+    ):
         """Submit a workflow, wait for completion, and return its first image."""
         prompt_id, error_msg = await self.submit(
             prompt,
             lora_selections=lora_selections,
             negative_prompt=negative_prompt,
+            workflow_filename=workflow_filename,
         )
         if not prompt_id:
             return None, error_msg

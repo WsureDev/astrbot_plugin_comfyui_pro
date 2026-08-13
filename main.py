@@ -7,6 +7,7 @@ import json
 import shutil
 import asyncio
 import copy
+import shlex
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, ResultContentType
 from astrbot.api.star import Context, Star, register
@@ -39,6 +40,7 @@ class _ComfyImageMarker:
     "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
 )
 class ComfyUIPlugin(Star):
+    _WORKFLOW_SCHEMA_REFRESH_INTERVAL_SECONDS = 60.0
     _FORCE_DRAW_CONTEXT_LIMIT = 12
     _FORCE_DRAW_MIN_REPLY_LENGTH = 100
     _MAX_REPEATED_IMAGES_PER_REQUEST = 16
@@ -46,14 +48,6 @@ class ComfyUIPlugin(Star):
     _BATCH_WAIT_STATE_EXTRA = "comfy_batch_wait_state"
     _DRAW_FAILURE_CONTEXT_TTL_SECONDS = 600
     _DRAW_FAILURE_CONTEXT_LIMIT = 5
-    _DRAW_NEGATIVE_SPLIT_PATTERN = re.compile(
-        r"\s+--(?:neg|negative)\b",
-        flags=re.IGNORECASE,
-    )
-    _DRAW_COUNT_PATTERN = re.compile(
-        r"(?<!\S)-c(?:\s*=\s*|\s+)(?P<count>\S+)",
-        flags=re.IGNORECASE,
-    )
     _PIC_PROMPT_TAG_PATTERN = re.compile(
         r'<pic\b[^>]*\bprompt=(?P<quote>["\'])(?P<prompt>.*?)(?P=quote)[^>]*?/?>\s*(?:</pic>)?',
         flags=re.DOTALL | re.IGNORECASE,
@@ -78,6 +72,8 @@ class ComfyUIPlugin(Star):
         self.workflow_dir = self.data_dir / "workflow"
         self.output_dir = self.data_dir / "output"
         self.sensitive_words_path = self.data_dir / "sensitive_words.json"
+        self._workflow_schema_watch_task = None
+        self._workflow_schema_signature = None
         
         # ====== 4. 更新 UI 配置 ======
         self._auto_update_schema()
@@ -229,38 +225,68 @@ class ComfyUIPlugin(Star):
                 logger.error(f"[ComfyUI] 复制敏感词文件失败: {e}")
 
     # ====== 更新 Schema ======
+    def _list_workflow_files(self):
+        if not self.workflow_dir.exists():
+            return []
+        return sorted(
+            f.name for f in self.workflow_dir.glob("*.json")
+            if not self._is_workflow_aux_file(f.name)
+        )
+
+    @staticmethod
+    def _set_workflow_schema_options(schema, files):
+        try:
+            target = schema['workflow_settings']['items']['json_file']
+        except (KeyError, TypeError):
+            return False
+
+        changed = target.get('options') != files or target.get('enum') != files
+        target['options'] = files
+        target['enum'] = files
+        return changed
+
     def _auto_update_schema(self):
-        """扫描持久化目录的工作流，更新 UI 下拉列表"""
+        """扫描持久化目录，并同步磁盘和 AstrBot 内存中的配置 schema。"""
         try:
             schema_path = PLUGIN_DIR / '_conf_schema.json'
-            workflow_dir = self.data_dir / 'workflow'
-
-            if not workflow_dir.exists():
-                return
-
-            # 排除 .steps.json 文件
-            files = sorted([
-                f.name for f in workflow_dir.glob("*.json")
-                if not self._is_workflow_aux_file(f.name)
-            ])
+            files = self._list_workflow_files()
         
             if not files:
                 files = ["workflow_api.json"]
 
+            signature = tuple(files)
+
+            memory_schema = getattr(self.config, "schema", None)
+            memory_changed = False
+            if isinstance(memory_schema, dict):
+                memory_changed = self._set_workflow_schema_options(memory_schema, files)
+
             with open(schema_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
-            target = data['workflow_settings']['items']['json_file']
-            target['options'] = files
-            target['enum'] = files
-        
-            with open(schema_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        
-            logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
+            disk_changed = self._set_workflow_schema_options(data, files)
+            if disk_changed:
+                with open(schema_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+
+            self._workflow_schema_signature = signature
+            if disk_changed or memory_changed:
+                logger.info(f"[ComfyUI] 🔄 工作流列表已更新: {len(files)} 个可用")
 
         except Exception as e:
             logger.error(f"[ComfyUI] 更新工作流列表失败: {e}")
+
+    async def _watch_workflow_schema(self):
+        while True:
+            await asyncio.sleep(self._WORKFLOW_SCHEMA_REFRESH_INTERVAL_SECONDS)
+            try:
+                files = self._list_workflow_files() or ["workflow_api.json"]
+                if tuple(files) != self._workflow_schema_signature:
+                    self._auto_update_schema()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[ComfyUI] 监听工作流目录失败: {e}")
 
     # ====== 权限检查（返回原因）======
     def _check_access(self, event: AstrMessageEvent) -> tuple:
@@ -342,36 +368,90 @@ class ComfyUIPlugin(Star):
         return text[:limit] + ("..." if len(text) > limit else "")
 
     @classmethod
-    def _parse_draw_command_payload(cls, raw_message: str) -> tuple[str, str | None, int | None]:
+    def _parse_draw_command_payload(
+        cls,
+        raw_message: str,
+    ) -> tuple[str, str | None, int | None, str | None]:
         full_message = str(raw_message or "").strip()
         parts = full_message.split(None, 1)
         arg_text = parts[1].strip() if len(parts) > 1 else ""
         if not arg_text:
-            return "", None, None
+            return "", None, None, None
 
+        try:
+            tokens = shlex.split(arg_text)
+        except ValueError as e:
+            raise ValueError(f"❌ 参数引号不完整：{e}") from None
+
+        option_names = {
+            "--count",
+            "-c",
+            "--neg",
+            "--negative",
+            "-n",
+            "--workflow",
+            "-wf",
+        }
+        prompt_tokens = []
+        negative_tokens = []
         count = None
-        count_match = cls._DRAW_COUNT_PATTERN.search(arg_text)
-        if count_match:
-            raw_count = count_match.group("count")
-            try:
-                count = int(raw_count)
-            except (TypeError, ValueError):
-                raise ValueError("❌ 图片数量必须是正整数，例如：-c 4") from None
-            arg_text = f"{arg_text[:count_match.start()]} {arg_text[count_match.end():]}".strip()
+        workflow = None
+        index = 0
 
-        match = cls._DRAW_NEGATIVE_SPLIT_PATTERN.search(arg_text)
-        if not match:
-            return arg_text, None, count
+        while index < len(tokens):
+            token = tokens[index]
+            option, separator, inline_value = token.partition("=")
+            option_key = option.casefold()
 
-        prompt = arg_text[:match.start()].strip()
-        negative_prompt = arg_text[match.end():].strip()
-        negative_prompt = re.sub(r"^(=|:|：)\s*", "", negative_prompt).strip()
-        return prompt, negative_prompt or None, count
+            if option_key in ("--count", "-c"):
+                if count is not None:
+                    raise ValueError("❌ 图片数量参数不能重复")
+                if not separator:
+                    index += 1
+                    if index >= len(tokens) or tokens[index].casefold() in option_names:
+                        raise ValueError("❌ 图片数量参数缺少值，例如：--count 4 或 -c 4")
+                    inline_value = tokens[index]
+                try:
+                    count = int(inline_value)
+                except (TypeError, ValueError):
+                    raise ValueError("❌ 图片数量必须是正整数，例如：--count 4 或 -c 4") from None
+            elif option_key in ("--workflow", "-wf"):
+                if workflow is not None:
+                    raise ValueError("❌ workflow 参数不能重复")
+                if not separator:
+                    index += 1
+                    if index >= len(tokens) or tokens[index].casefold() in option_names:
+                        raise ValueError("❌ workflow 参数缺少值，例如：--workflow animagine")
+                    inline_value = tokens[index]
+                workflow = str(inline_value or "").strip() or None
+            elif option_key in ("--neg", "--negative", "-n"):
+                if negative_tokens:
+                    raise ValueError("❌ 负面提示词参数不能重复")
+                if separator and inline_value:
+                    negative_tokens.append(inline_value)
+                index += 1
+                while index < len(tokens):
+                    next_token = tokens[index]
+                    next_option = next_token.partition("=")[0].casefold()
+                    if next_option in option_names:
+                        index -= 1
+                        break
+                    negative_tokens.append(next_token)
+                    index += 1
+                if not negative_tokens:
+                    raise ValueError("❌ 负面提示词参数缺少内容，例如：--neg lowres 或 -n lowres")
+            else:
+                prompt_tokens.append(token)
+            index += 1
+
+        prompt = " ".join(prompt_tokens).strip()
+        negative_prompt = " ".join(negative_tokens).strip() or None
+        return prompt, negative_prompt, count, workflow
 
     def _extract_command_prompt(self, event: AstrMessageEvent) -> str:
         full_message = (getattr(event, "message_str", "") or "").strip()
         try:
-            prompt, _, _ = self._parse_draw_command_payload(full_message)
+            prompt, _, _, _ = self._parse_draw_command_payload(full_message)
         except ValueError:
             return full_message
         return prompt
@@ -581,7 +661,7 @@ class ComfyUIPlugin(Star):
 
     @staticmethod
     def _is_workflow_aux_file(filename: str) -> bool:
-        return filename.endswith(".steps.json") or filename.endswith(".lora.json")
+        return filename.endswith((".steps.json", ".lora.json", ".profile.json"))
 
     @staticmethod
     def _strip_comfy_control_tags(text: str, remove_think: bool = False) -> str:
@@ -833,6 +913,18 @@ class ComfyUIPlugin(Star):
         my_prompt = (llm_settings.get("system_prompt", "") or "").strip()
         if not my_prompt:
             return ""
+
+        workflow_files = self._list_workflow_files()
+        if workflow_files:
+            default_workflow = getattr(self.api, "wf_filename", "") if self.api else ""
+            workflow_appendix = [
+                "【ComfyUI workflow 选择】",
+                f"默认 workflow：{default_workflow or '未配置'}",
+                "可用 workflow：" + ", ".join(workflow_files),
+                "调用 comfyui_txt2img 时，只有用户明确指定某个 workflow 才传 workflow 参数；",
+                "用户未指定时省略 workflow，系统会使用默认 workflow。不要编造列表外的名称。",
+            ]
+            my_prompt = f"{my_prompt}\n\n" + "\n".join(workflow_appendix)
 
         if self.lora_control_enabled and getattr(self, "api", None):
             try:
@@ -1171,7 +1263,20 @@ class ComfyUIPlugin(Star):
 
     async def initialize(self):
         self.context.activate_llm_tool("comfyui_txt2img")
+        self._auto_update_schema()
+        self._workflow_schema_watch_task = asyncio.create_task(
+            self._watch_workflow_schema(),
+        )
         logger.info("[ComfyUI] 🎨 插件初始化完成，LLM 工具已激活")
+
+    async def terminate(self):
+        if self._workflow_schema_watch_task:
+            self._workflow_schema_watch_task.cancel()
+            try:
+                await self._workflow_schema_watch_task
+            except asyncio.CancelledError:
+                pass
+            self._workflow_schema_watch_task = None
 
     # ====== 核心绘图逻辑 ======
     async def _handle_paint_logic(self, event: AstrMessageEvent, direct_send: bool):
@@ -1191,7 +1296,9 @@ class ComfyUIPlugin(Star):
         try:
             full_message = event.message_str.strip()
             try:
-                prompt, negative_prompt, requested_count = self._parse_draw_command_payload(full_message)
+                prompt, negative_prompt, requested_count, workflow = self._parse_draw_command_payload(
+                    full_message,
+                )
             except ValueError as e:
                 message = str(e)
                 self._remember_draw_failure(event, message, source="用户指令")
@@ -1201,7 +1308,8 @@ class ComfyUIPlugin(Star):
             if not prompt:
                 message = (
                     "❌ 请输入提示词，例如：/画图 1girl, smile\n"
-                    "可选参数：--neg lowres, bad hands -c 4"
+                    "可选参数：--workflow/-wf、--count/-c、--neg/-n\n"
+                    "示例：/画图 1girl -wf animagine -c 4 -n lowres, bad hands"
                 )
                 self._remember_draw_failure(event, message, source="用户指令")
                 yield event.plain_result(message)
@@ -1228,6 +1336,7 @@ class ComfyUIPlugin(Star):
                 event,
                 prompt=prompt,
                 negative_prompt=negative_prompt,
+                workflow=workflow,
                 count=requested_count,
                 direct_send=direct_send,
             ):
@@ -2275,14 +2384,15 @@ class ComfyUIPlugin(Star):
         full_msg = (event.message_str or "").strip()
         full_msg = re.sub(r'\[At:\d+\]\s*', '', full_msg).strip()
         try:
-            prompt, _, _ = self._parse_draw_command_payload(full_msg)
+            prompt, _, _, _ = self._parse_draw_command_payload(full_msg)
         except ValueError as e:
             yield event.plain_result(str(e))
             return
         if not prompt:
             yield event.plain_result(
-                "📖 用法: /重绘 <提示词> [-c <数量>] [--neg <负面词>]\n"
-                "示例: /重绘 1girl, silver hair, cinematic lighting -c 3 --neg lowres, bad hands"
+                "📖 用法: /重绘 <提示词> [--count <数量>|-c <数量>] "
+                "[--neg <负面词>|-n <负面词>] [--workflow <名称>|-wf <名称>]\n"
+                "示例: /重绘 1girl, silver hair -c 3 -n lowres -wf animagine"
             )
             return
         async for result in self._handle_paint_logic(event, direct_send=True):
@@ -2977,6 +3087,7 @@ class ComfyUIPlugin(Star):
         count: int,
         lora_selections=None,
         negative_prompt=None,
+        workflow=None,
     ) -> list[dict]:
         async def submit_one(index: int) -> dict:
             try:
@@ -2984,6 +3095,7 @@ class ComfyUIPlugin(Star):
                     prompt,
                     lora_selections=lora_selections,
                     negative_prompt=negative_prompt,
+                    workflow_filename=workflow,
                 )
                 if not prompt_id:
                     return {
@@ -3216,12 +3328,24 @@ class ComfyUIPlugin(Star):
         prompt: str = None,
         text: str = None,
         negative_prompt: str = None,
+        workflow: str = None,
         img_width: int = None,
         img_height: int = None,
         count: int = 1,
         direct_send: bool = False,
     ) -> MessageEventResult:
-        """ComfyUI 文生图工具；count>1 时对同一 prompt 并发生成多张图片。"""
+        """使用 ComfyUI 生成图片；未指定 workflow 时使用默认工作流。
+
+        Args:
+            prompt(string): 正面绘图提示词。
+            text(string): prompt 的兼容别名，仅在 prompt 为空时使用。
+            negative_prompt(string): 可选的负面提示词。
+            workflow(string): 可选的 workflow 文件名或不带 .json 的名称，只能从系统提供的列表中选择。
+            img_width(integer): 可选图片宽度；当前由 workflow 决定，保留用于兼容。
+            img_height(integer): 可选图片高度；当前由 workflow 决定，保留用于兼容。
+            count(integer): 生成数量，范围为 1 到 16。
+            direct_send(boolean): 是否逐张直接发送，通常保持 false。
+        """
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         # LLM 调用和用户指令的发送语义不同：LLM 工具必须让 Agent
         # 继续走完当前回合，AstrBot 才会把本轮上下文（包括工具调用）
@@ -3246,6 +3370,8 @@ class ComfyUIPlugin(Star):
             prompt = text
         if negative_prompt is not None:
             negative_prompt = str(negative_prompt).strip() or None
+        if workflow is not None:
+            workflow = str(workflow).strip() or None
 
         if not prompt:
             message = "❌ 未提供 prompt，请重试"
@@ -3285,6 +3411,19 @@ class ComfyUIPlugin(Star):
         # API 检查
         if not getattr(self, 'api', None):
             message = "❌ ComfyUI 服务未连接，请检查配置"
+            self._remember_draw_failure(
+                event,
+                message,
+                prompt=prompt,
+                source=draw_source,
+            )
+            yield message
+            return
+
+        try:
+            workflow = self.api.resolve_workflow_filename(workflow)
+        except Exception as e:
+            message = f"❌ workflow 无效：{e}"
             self._remember_draw_failure(
                 event,
                 message,
@@ -3340,6 +3479,8 @@ class ComfyUIPlugin(Star):
                 return
 
             log_message = f"[ComfyUI] 🎨 开始生成 | 用户: {event.get_sender_id()} | Prompt: {prompt}"
+            if workflow:
+                log_message += f" | Workflow: {workflow}"
             if negative_prompt:
                 log_message += f" | Negative: {negative_prompt}"
             if requested_count > 1:
@@ -3352,6 +3493,7 @@ class ComfyUIPlugin(Star):
                     requested_count,
                     lora_selections=lora_selections,
                     negative_prompt=negative_prompt,
+                    workflow=workflow,
                 )
                 accepted_count = sum(
                     1 for item in submitted_items if item["status"] == "submitted"
@@ -3387,10 +3529,15 @@ class ComfyUIPlugin(Star):
                     f"{accepted_count} 个任务"
                 )
 
-                tasks = [
-                    asyncio.create_task(self._collect_submitted_batch_result(item))
-                    for item in submitted_items
-                ]
+                task_items = {}
+                for submitted_item in submitted_items:
+                    task = asyncio.create_task(
+                        self._collect_submitted_batch_result(
+                            submitted_item,
+                            timeout_seconds=None,
+                        )
+                    )
+                    task_items[task] = submitted_item
                 completed_results = []
 
                 def result_status_text(item: dict) -> str:
@@ -3412,25 +3559,70 @@ class ComfyUIPlugin(Star):
                     else:
                         item["message"] = result
 
-                for completed_task in asyncio.as_completed(tasks):
-                    item = await completed_task
-                    completed_results.append(item)
-                    if item["status"] != "success":
-                        self._remember_draw_failure(
-                            event,
-                            f"第 {item['index']} 张图片{result_status_text(item)}：{item['error']}",
-                            prompt=prompt,
-                            source=f"{draw_source} 图片{item['index']}",
-                            append=True,
-                        )
-                    if direct_send:
-                        try:
-                            await send_single_result(item)
-                        except Exception as e:
-                            logger.error(
-                                f"[ComfyUI] 批量图片 {item['index']} 发送异常: {e}"
+                pending = set(task_items)
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=self._BATCH_WAIT_TIMEOUT_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        timed_out_tasks = list(pending)
+                        pending.clear()
+                        for task in timed_out_tasks:
+                            submitted_item = task_items[task]
+                            task.cancel()
+                            item = {
+                                "index": submitted_item["index"],
+                                "status": "timeout",
+                                "error": (
+                                    f"连续 {self._BATCH_WAIT_TIMEOUT_SECONDS} 秒"
+                                    "没有收到新的图片结果"
+                                ),
+                            }
+                            completed_results.append(item)
+                            self._remember_draw_failure(
+                                event,
+                                f"第 {item['index']} 张图片超时：{item['error']}",
+                                prompt=prompt,
+                                source=f"{draw_source} 图片{item['index']}",
+                                append=True,
                             )
-                        if not is_llm_tool_call:
+                            if direct_send:
+                                await send_single_result(item)
+                                yield item["message"]
+                        await asyncio.gather(
+                            *timed_out_tasks,
+                            return_exceptions=True,
+                        )
+                        logger.warning(
+                            f"[ComfyUI] 命令批次滑动超时，剩余 "
+                            f"{len(timed_out_tasks)} 个任务"
+                        )
+                        break
+
+                    logger.info(
+                        f"[ComfyUI] 命令批次收到 {len(done)} 个终态结果，"
+                        f"重置 {self._BATCH_WAIT_TIMEOUT_SECONDS} 秒等待窗口"
+                    )
+                    for completed_task in done:
+                        item = await completed_task
+                        completed_results.append(item)
+                        if item["status"] != "success":
+                            self._remember_draw_failure(
+                                event,
+                                f"第 {item['index']} 张图片{result_status_text(item)}：{item['error']}",
+                                prompt=prompt,
+                                source=f"{draw_source} 图片{item['index']}",
+                                append=True,
+                            )
+                        if direct_send:
+                            try:
+                                await send_single_result(item)
+                            except Exception as e:
+                                logger.error(
+                                    f"[ComfyUI] 批量图片 {item['index']} 发送异常: {e}"
+                                )
                             yield item["message"]
 
                 if all(item["status"] == "success" for item in completed_results):
@@ -3506,6 +3698,7 @@ class ComfyUIPlugin(Star):
                 prompt,
                 lora_selections=lora_selections,
                 negative_prompt=negative_prompt,
+                workflow_filename=workflow,
             )
 
             if not img_data:
