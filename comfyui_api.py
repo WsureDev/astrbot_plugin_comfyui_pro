@@ -1391,6 +1391,53 @@ class ComfyUI:
 
         return override_count
 
+    @staticmethod
+    def _summarize_comfy_error(error_data, raw_text: str, limit: int = 1600) -> str:
+        if not isinstance(error_data, dict):
+            summary = str(raw_text or "").strip() or "ComfyUI 未返回错误详情"
+            return summary[:limit]
+
+        parts = []
+        error = error_data.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("type") or "").strip()
+            details = str(error.get("details") or "").strip()
+            if message:
+                parts.append(message)
+            if details and details != message:
+                parts.append(details)
+        elif error:
+            parts.append(str(error).strip())
+
+        node_errors = error_data.get("node_errors")
+        if isinstance(node_errors, dict):
+            for node_id, node_error in node_errors.items():
+                if not isinstance(node_error, dict):
+                    continue
+                class_type = str(node_error.get("class_type") or "unknown")
+                errors = node_error.get("errors") or []
+                if not isinstance(errors, list):
+                    errors = [errors]
+                for item in errors:
+                    if not isinstance(item, dict):
+                        continue
+                    item_message = str(item.get("message") or item.get("type") or "validation failed").strip()
+                    item_details = str(item.get("details") or "").strip()
+                    extra_info = item.get("extra_info") or {}
+                    input_name = extra_info.get("input_name") if isinstance(extra_info, dict) else None
+                    prefix = f"节点 {node_id} ({class_type})"
+                    if input_name:
+                        prefix += f" 输入 {input_name}"
+                    text = f"{prefix}: {item_message}"
+                    if item_details and item_details != item_message:
+                        text += f"，{item_details}"
+                    parts.append(text)
+
+        summary = "；".join(part for part in parts if part)
+        if not summary:
+            summary = str(raw_text or "").strip() or "ComfyUI 未返回错误详情"
+        return summary[:limit]
+
     async def submit(
         self,
         prompt,
@@ -1429,7 +1476,36 @@ class ComfyUI:
             try:
                 async with session.post(f"{self.url}/prompt", json=payload) as resp:
                     if resp.status != 200:
-                        return None, f"连接 ComfyUI 失败: {resp.status}"
+                        raw_error = await resp.text()
+                        try:
+                            error_data = json.loads(raw_error)
+                        except (TypeError, json.JSONDecodeError):
+                            error_data = None
+
+                        if isinstance(error_data, dict):
+                            formatted_error = json.dumps(
+                                error_data,
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                        else:
+                            formatted_error = raw_error.strip() or "<empty response body>"
+
+                        logger.error(
+                            "[ComfyUI] prompt submission rejected | status=%s %s | "
+                            "workflow=%s | client_id=%s | url=%s/prompt\n%s",
+                            resp.status,
+                            resp.reason or "",
+                            resolved_filename,
+                            client_id,
+                            self.url,
+                            formatted_error,
+                        )
+                        summary = self._summarize_comfy_error(
+                            error_data,
+                            raw_error,
+                        )
+                        return None, f"ComfyUI 拒绝工作流 ({resp.status}): {summary}"
                     res_json = await resp.json()
                     prompt_id = res_json.get("prompt_id")
             except Exception as e:
