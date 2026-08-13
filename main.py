@@ -3341,9 +3341,9 @@ class ComfyUIPlugin(Star):
             text(string): prompt 的兼容别名，仅在 prompt 为空时使用。
             negative_prompt(string): 可选的负面提示词。
             workflow(string): 可选的 workflow 文件名或不带 .json 的名称，只能从系统提供的列表中选择。
-            img_width(integer): 可选图片宽度；当前由 workflow 决定，保留用于兼容。
-            img_height(integer): 可选图片高度；当前由 workflow 决定，保留用于兼容。
-            count(integer): 生成数量，范围为 1 到 16。
+            img_width(int): 可选图片宽度；当前由 workflow 决定，保留用于兼容。
+            img_height(int): 可选图片高度；当前由 workflow 决定，保留用于兼容。
+            count(int): 生成数量，范围为 1 到 16。
             direct_send(boolean): 是否逐张直接发送，通常保持 false。
         """
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
