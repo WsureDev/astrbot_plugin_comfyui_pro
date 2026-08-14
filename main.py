@@ -8,6 +8,7 @@ import shutil
 import asyncio
 import copy
 import shlex
+import random
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, ResultContentType
 from astrbot.api.star import Context, Star, register
@@ -2456,6 +2457,18 @@ class ComfyUIPlugin(Star):
                 continue
         return None
 
+    def _get_forward_user_id(self, event: AstrMessageEvent) -> int:
+        self_id = self._get_self_id(event)
+        try:
+            return int(self_id)
+        except (TypeError, ValueError):
+            fallback_id = random.randint(100000000, 999999999)
+            logger.warning(
+                f"[ComfyUI] 无法将 self_id={self_id!r} 转换为数字，"
+                f"转发节点将使用随机 ID: {fallback_id}"
+            )
+            return fallback_id
+
     def _is_ascii_term(self, s: str) -> bool:
         return all(ord(ch) < 128 for ch in s)
 
@@ -3272,7 +3285,7 @@ class ComfyUIPlugin(Star):
         if direct_send:
             await event.send(MessageChain().message(summary))
         else:
-            self_id = self._get_self_id(event) or "0"
+            forward_user_id = self._get_forward_user_id(event)
             nodes = []
             for item in sorted(completed_results, key=lambda value: value["index"]):
                 if item["status"] == "success":
@@ -3285,14 +3298,14 @@ class ComfyUIPlugin(Star):
                     ]
                 nodes.append(
                     Node(
-                        user_id=int(self_id),
+                        user_id=forward_user_id,
                         nickname=f"ComfyUI 图片{item['index']}",
                         content=content,
                     )
                 )
             nodes.append(
                 Node(
-                    user_id=int(self_id),
+                    user_id=forward_user_id,
                     nickname="ComfyUI 统计",
                     content=[Plain(summary)],
                 )
@@ -3643,7 +3656,7 @@ class ComfyUIPlugin(Star):
                 )
 
                 if not direct_send:
-                    self_id = self._get_self_id(event) or "0"
+                    forward_user_id = self._get_forward_user_id(event)
                     nodes = []
                     for item in sorted(completed_results, key=lambda value: value["index"]):
                         if item["status"] == "success":
@@ -3656,14 +3669,14 @@ class ComfyUIPlugin(Star):
                             ]
                         nodes.append(
                             Node(
-                                user_id=int(self_id),
+                                user_id=forward_user_id,
                                 nickname=f"ComfyUI 图片{item['index']}",
                                 content=content,
                             )
                         )
                     nodes.append(
                         Node(
-                            user_id=int(self_id),
+                            user_id=forward_user_id,
                             nickname="ComfyUI 统计",
                             content=[Plain(summary)],
                         )
@@ -3727,10 +3740,10 @@ class ComfyUIPlugin(Star):
                 image_component = Image.fromFileSystem(str(img_path))
                 result = event.chain_result([image_component])
             else:
-                self_id = self._get_self_id(event) or "0"
+                forward_user_id = self._get_forward_user_id(event)
                 image_component = Image.fromFileSystem(str(img_path))
                 forward_node = Node(
-                    user_id=int(self_id),
+                    user_id=forward_user_id,
                     nickname="ComfyUI",
                     content=[image_component]
                 )
