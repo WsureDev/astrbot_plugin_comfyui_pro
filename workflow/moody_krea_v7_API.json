@@ -1,0 +1,71 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "Moody-Krea-Mix-v7_00002__clean_fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Moody Krea v7 FP8" }
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+      "type": "krea2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load Krea 2 Text Encoder" }
+  },
+  "3": {
+    "inputs": { "vae_name": "qwen_image_vae.safetensors" },
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load Qwen Image VAE" }
+  },
+  "5": {
+    "inputs": {
+      "text": "",
+      "clip": ["2", 0]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Positive Prompt" }
+  },
+  "6": {
+    "inputs": {
+      "text": "",
+      "clip": ["2", 0]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "Negative Prompt" }
+  },
+  "7": {
+    "inputs": { "width": 1024, "height": 1024, "batch_size": 1 },
+    "class_type": "EmptyLatentImage",
+    "_meta": { "title": "Latent Image" }
+  },
+  "13": {
+    "inputs": {
+      "seed": 0,
+      "steps": 28,
+      "cfg": 4.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": ["1", 0],
+      "positive": ["5", 0],
+      "negative": ["6", 0],
+      "latent_image": ["7", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": { "title": "Krea 2 Sampler" }
+  },
+  "14": {
+    "inputs": { "samples": ["13", 0], "vae": ["3", 0] },
+    "class_type": "VAEDecode",
+    "_meta": { "title": "Decode Image" }
+  },
+  "15": {
+    "inputs": { "filename_prefix": "Moody-Krea-v7", "images": ["14", 0] },
+    "class_type": "SaveImage",
+    "_meta": { "title": "Save Image" }
+  }
+}

@@ -206,6 +206,7 @@ class ComfyUI:
             f"当前节点设置: Positive={self.input_id}, Negative={self.neg_node_id}, Output={self.output_id or '自动'}"
         )
 
+
     @staticmethod
     def _parse_lora_scan_roots(value) -> list:
         if isinstance(value, (list, tuple, set)):
@@ -1515,7 +1516,7 @@ class ComfyUI:
             return None, "ComfyUI 未返回 prompt_id"
         return str(prompt_id), None
 
-    async def wait_for_result(self, prompt_id, timeout_seconds=120):
+    async def wait_for_result(self, prompt_id, timeout_seconds=300):
         """Wait for a submitted workflow and download its first image output."""
         async with aiohttp.ClientSession() as session:
             polls = 0
