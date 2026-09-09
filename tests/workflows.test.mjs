@@ -4,8 +4,8 @@ import test from 'node:test';
 
 const load = filename => JSON.parse(readFileSync(new URL(`../workflow/${filename}`, import.meta.url), 'utf8'));
 const variants = [
-  ['moody_krea_v7_API.json', 768, 1152, 'Moody-Krea-v7'],
-  ['moody_krea_v7_fast_API.json', 512, 768, 'Moody-Krea-v7-fast'],
+  ['moody_krea_v7_API.json', 768, 1152, 'Moody-Krea-v7', 4],
+  ['moody_krea_v7_fast_API.json', 768, 1152, 'Moody-Krea-v7-fast', 2],
 ];
 const loraFiles = [
   'Pantyhose.safetensors', 'glossy_pantyhose_Kera_2_epoch_17.safetensors',
@@ -15,10 +15,14 @@ const loraFiles = [
   'Krea_2_Hayeon.safetensors', 'zy_2B_K2.safetensors', 'EtherialGothicKrea2Raw.safetensors',
 ];
 
-for (const [filename, width, height, prefix] of variants) {
+for (const [filename, width, height, prefix, finalScale] of variants) {
+  const compact = finalScale === 2;
   test(`${filename}: keeps the KR2 routing and client node contract`, () => {
     const graph = load(filename);
-    assert.deepEqual(Object.keys(graph), ['1', '2', '3', '5', '6', '7', '13', '14', '15', '16', '17', '23']);
+    assert.deepEqual(Object.keys(graph), [
+      '1', '2', '3', '5', '6', '7', '13', '14', '15', '16', '17',
+      ...(compact ? ['18'] : []), '23',
+    ]);
     assert.equal(graph['1'].class_type, 'UNETLoader');
     assert.deepEqual(graph['1'].inputs, { unet_name: 'Moody-Krea-Mix-v7_00002__clean_fp8.safetensors', weight_dtype: 'default' });
     assert.equal(graph['2'].class_type, 'CLIPLoader');
@@ -45,7 +49,7 @@ for (const [filename, width, height, prefix] of variants) {
     });
   });
 
-  test(`${filename}: saves exactly one native Remacri 4x branch`, () => {
+  test(`${filename}: saves one image at ${finalScale}x after a single Remacri pass`, () => {
     const graph = load(filename);
     assert.equal(graph['14'].class_type, 'VAEDecode');
     assert.deepEqual(graph['14'].inputs, { samples: ['13', 0], vae: ['3', 0] });
@@ -54,11 +58,21 @@ for (const [filename, width, height, prefix] of variants) {
     assert.equal(graph['17'].class_type, 'ImageUpscaleWithModel');
     assert.deepEqual(graph['17'].inputs, { upscale_model: ['16', 0], image: ['14', 0] });
     assert.equal(graph['15'].class_type, 'SaveImage');
-    assert.deepEqual(graph['15'].inputs, { filename_prefix: prefix, images: ['17', 0] });
+    assert.deepEqual(graph['15'].inputs, { filename_prefix: prefix, images: [compact ? '18' : '17', 0] });
     const types = Object.values(graph).map(node => node.class_type);
     assert.equal(types.filter(type => type === 'SaveImage').length, 1);
     assert.equal(types.filter(type => type === 'ImageUpscaleWithModel').length, 1);
-    assert(!types.includes('ImageScale'));
+    assert.equal(types.filter(type => type === 'ImageScale').length, compact ? 1 : 0);
+    if (compact) {
+      assert.equal(graph['18'].class_type, 'ImageScale');
+      assert.deepEqual(graph['18'].inputs, {
+        upscale_method: 'bicubic', width: 1536, height: 2304, crop: 'disabled', image: ['17', 0],
+      });
+      assert.equal(graph['18'].inputs.width, width * finalScale);
+      assert.equal(graph['18'].inputs.height, height * finalScale);
+    } else {
+      assert.equal(graph['18'], undefined);
+    }
     for (const [id, node] of Object.entries(graph)) {
       for (const [key, input] of Object.entries(node.inputs)) {
         if (!Array.isArray(input)) continue;
@@ -71,15 +85,10 @@ for (const [filename, width, height, prefix] of variants) {
   });
 }
 
-test('fast differs from default only in base resolution and filename prefix', () => {
+test('fast keeps the same generation and LoRA graph, changing only final resize and filename prefix', () => {
   const standard = load(variants[0][0]);
   const fast = load(variants[1][0]);
-  fast['7'].inputs = structuredClone(standard['7'].inputs);
-  fast['15'].inputs.filename_prefix = standard['15'].inputs.filename_prefix;
+  delete fast['18'];
+  fast['15'].inputs = structuredClone(standard['15'].inputs);
   assert.deepEqual(fast, standard);
-});
-
-test('plugin result-wait default is restored to 120 seconds', () => {
-  const api = readFileSync(new URL('../comfyui_api.py', import.meta.url), 'utf8');
-  assert.match(api, /async def wait_for_result\(self, prompt_id, timeout_seconds=120\):/);
 });

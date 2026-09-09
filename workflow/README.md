@@ -1,16 +1,23 @@
 # Krea 2 workflow templates
 
-| Template | Base resolution | Remacri 4x output |
+| Template | Base resolution | Saved image size |
 | --- | --- | --- |
 | `moody_krea_v7_API.json` | 768×1152 | 3072×4608 |
-| `moody_krea_v7_fast_API.json` | 512×768 | 2048×3072 |
+| `moody_krea_v7_fast_API.json` | 768×1152 | 1536×2304 |
 
 Both use Moody Krea v7 FP8, 12 steps, CFG 1, Euler / simple, and one image.
-They share the same model dependencies, with one Remacri pass and no final resize.
+They share the same model dependencies. The default keeps the native 4x output;
+fast uses the same 768×1152 generation base, runs Remacri 4x, then resizes to
+1536×2304 (compact 2x final output) to control transfer size. Fast keeps the
+same sampling resolution and LoRA support; it reduces final image size, not
+Remacri's 4x intermediate computation. PNG file size depends on content and
+is not guaranteed to stay below 4 MB.
 
 Plugin node settings: positive `5`, negative `6`, output `15`. Node `23` is
 `Lora Loader (LoraManager)`; its MODEL output feeds sampler `13` and its CLIP
-output feeds both prompt encoders. Keep these node IDs unchanged.
+output feeds both prompt encoders. Output node `15` saves node `17` in the
+default template and node `18` (final bicubic resize) in fast. Keep these node
+IDs unchanged.
 
 The templates list eleven reviewed Krea 2 LoRAs, **all disabled by default**.
 Without a LoRA selection, node `23` passes MODEL/CLIP through unchanged and does
