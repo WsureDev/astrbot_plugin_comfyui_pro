@@ -1516,7 +1516,7 @@ class ComfyUI:
             return None, "ComfyUI 未返回 prompt_id"
         return str(prompt_id), None
 
-    async def wait_for_result(self, prompt_id, timeout_seconds=300):
+    async def wait_for_result(self, prompt_id, timeout_seconds=120):
         """Wait for a submitted workflow and download its first image output."""
         async with aiohttp.ClientSession() as session:
             polls = 0
