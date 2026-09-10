@@ -57,6 +57,13 @@ class ComfyUIPlugin(Star):
         r'<pic\b(?P<prefix>[^>]*\bprompt=)(?P<quote>["\'])(?P<prompt>.*?)</pic>',
         flags=re.DOTALL | re.IGNORECASE,
     )
+    # LoRA control tags are part of the prompt language, not shell options.
+    # Protect them while parsing command options so shlex does not consume the
+    # quotes that _extract_lora_control_tags() needs in order to recognize them.
+    _LORA_CONTROL_TAG_PATTERN = re.compile(
+        r'<lora\s+picks=".*?"\s*/?>',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -379,10 +386,36 @@ class ComfyUIPlugin(Star):
         if not arg_text:
             return "", None, None, None
 
+        # shlex.split() is still used for the command's real options, but a
+        # normal prompt may contain a complete <lora picks="..."> tag.  If
+        # passed directly to shlex, its quotes are removed and the tag becomes
+        # unparseable by _extract_lora_control_tags(). Replace each complete
+        # tag with an opaque token for the duration of shell parsing, then
+        # restore the exact original text in every token (including adjacent
+        # punctuation).
+        protected_lora_tags = []
+
+        def protect_lora_tag(match):
+            placeholder = f"__COMFYUI_LORA_TAG_{len(protected_lora_tags)}__"
+            protected_lora_tags.append((placeholder, match.group(0)))
+            return placeholder
+
+        protected_arg_text = cls._LORA_CONTROL_TAG_PATTERN.sub(
+            protect_lora_tag,
+            arg_text,
+        )
+
         try:
-            tokens = shlex.split(arg_text)
+            tokens = shlex.split(protected_arg_text)
         except ValueError as e:
             raise ValueError(f"❌ 参数引号不完整：{e}") from None
+
+        if protected_lora_tags:
+            for index, token in enumerate(tokens):
+                for placeholder, original_tag in protected_lora_tags:
+                    if placeholder in token:
+                        token = token.replace(placeholder, original_tag)
+                tokens[index] = token
 
         option_names = {
             "--count",
