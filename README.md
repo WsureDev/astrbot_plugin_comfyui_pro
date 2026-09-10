@@ -85,6 +85,10 @@
 
 ## 📖 指令与用法
 
+### LLM 工具详细说明
+
+`comfyui_txt2img` 的参数、workflow 选择、LoRA 标签和 JSON/XML 转义规则见 [docs/comfyui_txt2img_tool.md](docs/comfyui_txt2img_tool.md)。该文档与工具函数 docstring 同步维护，适合作为模型调用速查。
+
 ### 方式一：自然语言对话 (推荐)
 直接与机器人对话，让它帮你画。
 *   **你**: “帮我画一只猫，赛博朋克风格，在下雨的东京街头”

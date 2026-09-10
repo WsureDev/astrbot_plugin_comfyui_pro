@@ -1429,9 +1429,11 @@ class ComfyUIPlugin(Star):
             "━━━━━━━━━━━━━━━━━━",
             "",
             "【基础指令】",
-            "  /画图 <提示词> [-c <数量>] [--neg <负面词>]     生成图片（转发模式）",
-            "  /画图no <提示词> [-c <数量>] [--neg <负面词>]   生成图片（直发模式）",
-            "  /重绘 <提示词> [-c <数量>] [--neg <负面词>]     直接重绘",
+            "  /画图 <提示词> [-wf <名称>] [-c <数量>] [-n <负面词>] 生成图片（转发模式）",
+            "  /画图no <提示词> [-wf <名称>] [-c <数量>] [-n <负面词>] 生成图片（直发模式）",
+            "  /重绘 <提示词> [-wf <名称>] [-c <数量>] [-n <负面词>] 直接重绘",
+            "  workflow 未指定时使用默认值；支持 -wf，不支持 -w",
+            "  示例：/画图 1girl, smile -wf example_workflow -c 2 -n lowres, bad hands",
             "  /comfy帮助         显示此帮助",
             "",
             "【LLM 模式】",
@@ -3380,17 +3382,29 @@ class ComfyUIPlugin(Star):
         count: int = 1,
         direct_send: bool = False,
     ) -> MessageEventResult:
-        """使用 ComfyUI 生成图片；未指定 workflow 时使用默认工作流。
+        """使用 ComfyUI 生成图片。
+
+        LLM 调用规则：`prompt` 必填，优先使用英文 Danbooru/Stable Diffusion tags，
+        用半角逗号分隔；`negative_prompt` 独立传入，不要把 `--neg` 拼进 prompt。
+        `workflow` 可选，只能填系统提供的 workflow 文件名或不带 `.json` 的名称；
+        用户未明确指定时省略，不要猜测名称。prompt 可包含
+        `<lora picks="...">`，例如 `<lora picks="character.safetensors:0.8@1">`，
+        默认最多 4 个（可由 lora_control.max_lora_count 调整）；`@1+2` 表示多个触发词候选，
+        `!clear_defaults` 表示清除默认 LoRA。
+        不要对 prompt 做 URL、Base64 或 HTML 实体编码；JSON/XML 调用中的引号、
+        反斜杠和换行交给序列化器转义，不要把 `&quot;` 写进 LoRA 标签。
+        这是函数调用，不使用 `/画图` 的 `--workflow`、`-wf`、`--neg`、`-n` 语法。
+        工具返回图片或错误信息，不要编造结果；一次最多生成 16 张。
 
         Args:
-            prompt(string): 正面绘图提示词。
-            text(string): prompt 的兼容别名，仅在 prompt 为空时使用。
-            negative_prompt(string): 可选的负面提示词。
-            workflow(string): 可选的 workflow 文件名或不带 .json 的名称，只能从系统提供的列表中选择。
-            img_width(int): 可选图片宽度；当前由 workflow 决定，保留用于兼容。
-            img_height(int): 可选图片高度；当前由 workflow 决定，保留用于兼容。
-            count(int): 生成数量，范围为 1 到 16。
-            direct_send(boolean): 是否逐张直接发送，通常保持 false。
+            prompt(string): 必填的正向提示词；推荐英文 tags，半角逗号分隔，可包含 LoRA 标签。
+            text(string): prompt 为空时的兼容备用字段，一般不传。
+            negative_prompt(string): 独立的负向提示词；未传时保留 workflow 内置负面词并追加插件默认词。
+            workflow(string): 可选 workflow 文件名或 stem；只能从运行时提供的列表中选择，省略时使用默认 workflow。
+            img_width(int): 兼容字段；尺寸由 workflow 决定，通常不传。
+            img_height(int): 兼容字段；尺寸由 workflow 决定，通常不传。
+            count(int): 生成数量，范围为 1 到 16，默认 1。
+            direct_send(boolean): true 逐张直接发送，false 使用转发卡片；不支持转发的平台传 true。
         """
         draw_source = event.get_extra("comfy_draw_source") or "LLM 工具"
         # LLM 调用和用户指令的发送语义不同：LLM 工具必须让 Agent
