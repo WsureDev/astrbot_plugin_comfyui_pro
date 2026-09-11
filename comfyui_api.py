@@ -11,6 +11,8 @@ import requests
 
 from astrbot.api import logger
 
+from .workflow_info import inspect_workflow_models
+
 
 DEFAULT_CONNECT_TIMEOUT = 10
 DEFAULT_READ_TIMEOUT = 180
@@ -513,6 +515,15 @@ class ComfyUI:
     def resolve_workflow_filename(self, workflow_filename: str = None) -> str:
         return self._resolve_workflow_path(workflow_filename)[1]
 
+    def get_workflow_info(self, workflow_filename: str = None) -> dict:
+        """Inspect the selected local API JSON without contacting a backend."""
+        filename = self.resolve_workflow_filename(workflow_filename)
+        return {
+            "workflow": filename,
+            "is_default": filename == self.wf_filename,
+            **inspect_workflow_models(self._load_workflow(filename)),
+        }
+
     def _get_lora_manifest_path(self, workflow_filename: str = None) -> Path:
         workflow_path, _ = self._resolve_workflow_path(workflow_filename)
         return workflow_path.parent / f"{workflow_path.stem}{LORA_MANIFEST_SUFFIX}"
@@ -850,10 +861,12 @@ class ComfyUI:
         default_loras = context.get("default_active_loras", [])
         lines = [
             "--------------------------------------------------",
-            "【五、可选 LoRA 堆控制】",
+            "【可选 LoRA 堆控制】",
             "--------------------------------------------------",
             "",
-            "当前工作流支持 LoRA 堆联动。",
+            f"以下 LoRA 清单属于默认工作流 {self.wf_filename}；不代表其他工作流的模型兼容性。",
+            "LoRA 的选择与描述形式遵循用户的人格/系统提示词和当前画图要求。",
+            "调用 comfyui_txt2img 时把控制标签放进 prompt 字符串。",
             "如果当前画面确实需要特定 LoRA，请在对应的 `<pic prompt=\"...\">` 之前额外输出一个标签：",
             "`<lora picks=\"LoRA名:强度@触发词序号, 另一个LoRA名:强度:clip强度@1+2\">`",
             "",
@@ -861,11 +874,9 @@ class ComfyUI:
             f"如果想只在本次图片里禁用工作流默认 LoRA，请输出：`<lora picks=\"{LORA_CLEAR_DEFAULTS_TOKEN}\">`。",
             f"如果想禁用默认 LoRA 后改用别的 LoRA，请输出：`<lora picks=\"{LORA_CLEAR_DEFAULTS_TOKEN}, LoRA名:0.8@1\">`。",
             "这里的 `@1`、`@1+2` 表示使用该 LoRA 下方列出来的第 1 个或第 1+2 个触发词候选。",
-            "如果某个 LoRA 没有触发词候选，就把它视为全局风格 LoRA，直接选 LoRA 本体即可。",
-            "重点规则：只要你写了 `@序号`，就表示系统会自动把该编号对应的触发词注入最终 prompt。",
-            "因此，`<pic prompt>` 里不要再手动复述同一组触发词，不要把角色名、发色、服装、固定特征整段再写一遍。",
-            "选择了 `@序号` 后，`<pic prompt>` 只写额外画面需求，例如构图、动作、表情、镜头、环境、光照、氛围。",
-            "只有在触发词没有覆盖到某个关键信息时，才额外补少量缺失 tags；不要原样照抄触发词全文。",
+            "缺少触发词候选不代表该 LoRA 属于某种风格或兼容任意模型，需以用户提供的模型资料为准。",
+            f"选中触发词自动注入开关：{'开启' if self.inject_selected_lora_hints else '关闭'}。开启时 `@序号` 对应的候选会注入最终 prompt。",
+            "自动注入开启时，prompt 只需补充触发词未覆盖的画面需求；关闭时根据用户要求自行编写完整提示词。",
             "",
         ]
 

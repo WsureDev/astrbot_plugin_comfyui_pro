@@ -9,6 +9,7 @@ import asyncio
 import copy
 import shlex
 import random
+import hashlib
 from pathlib import Path
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, ResultContentType
 from astrbot.api.star import Context, Star, register
@@ -594,6 +595,10 @@ class ComfyUIPlugin(Star):
     async def inject_system_prompt(self, event: AstrMessageEvent, req):
         """注入系统提示词 + 清理历史中的绘图提示词"""
         try:
+            # Keep the incoming persona/system instructions for supplemental requests,
+            # which call the provider directly and bypass AstrBot's persona assembly.
+            if event.get_extra("comfy_user_system_prompt") is None:
+                event.set_extra("comfy_user_system_prompt", getattr(req, "system_prompt", "") or "")
             my_prompt = self._get_comfy_system_prompt()
 
             if my_prompt:
@@ -942,23 +947,45 @@ class ComfyUIPlugin(Star):
             rendered.append(f"[{idx}] {text}")
         return " | ".join(rendered)
 
+    def _get_workflow_catalog(self, workflow: str = None) -> dict:
+        if not getattr(self, "api", None):
+            return {"error": "ComfyUI API 未初始化"}
+        selector = str(workflow or "").strip()
+        filenames = (
+            [self.api.resolve_workflow_filename(selector)]
+            if selector
+            else self._list_workflow_files()
+        )
+        entries = []
+        for filename in filenames:
+            try:
+                entries.append(self.api.get_workflow_info(filename))
+            except Exception as e:
+                entries.append({"workflow": filename, "error": str(e)})
+        return {
+            "default_workflow": self.api.wf_filename,
+            "workflows": entries,
+            "environment_notes": (self.config.get("llm_settings", {}) or {}).get("environment_prompt", "") or "",
+            "scope": "本地 API JSON 的静态模型声明；不验证服务端安装或实际执行分支。LoRA 仅列模板中启用的项，运行时选择可改变它们。",
+            "guidance": "根据用户的人格/系统提示词和本次要求，结合模型声明选择提示词形式、风格及实际可用的 MCP/skill。文件名和 encoder_type 不是提示词能力证明；未知时查询用户指定资料或询问用户，不预制推荐。",
+        }
+
     def _get_comfy_system_prompt(self) -> str:
         llm_settings = self.config.get("llm_settings", {}) or {}
         my_prompt = (llm_settings.get("system_prompt", "") or "").strip()
-        if not my_prompt:
-            return ""
-
-        workflow_files = self._list_workflow_files()
-        if workflow_files:
-            default_workflow = getattr(self.api, "wf_filename", "") if self.api else ""
-            workflow_appendix = [
-                "【ComfyUI workflow 选择】",
-                f"默认 workflow：{default_workflow or '未配置'}",
-                "可用 workflow：" + ", ".join(workflow_files),
-                "调用 comfyui_txt2img 时，只有用户明确指定某个 workflow 才传 workflow 参数；",
-                "用户未指定时省略 workflow，系统会使用默认 workflow。不要编造列表外的名称。",
-            ]
-            my_prompt = f"{my_prompt}\n\n" + "\n".join(workflow_appendix)
+        # Upgrade only the verbatim former built-in default, never custom persona text.
+        if hashlib.sha256(my_prompt.encode("utf-8")).hexdigest() == "3c6284391679aeb398e774aa7df3738cf9c69d92388ffd2f38ced4ceea68a74a":
+            with (PLUGIN_DIR / "_conf_schema.json").open(encoding="utf-8") as source:
+                my_prompt = json.load(source)["llm_settings"]["items"]["system_prompt"]["default"]
+        workflow_appendix = [
+            "【ComfyUI 画图提示词编写助手：工作流与模型信息】",
+            "以下为插件协议和实例数据；提示词语言、形式、风格、MCP/skill 使用建议遵循用户的人格/系统提示词和本次要求。",
+            "需要确认模型时可调用只读工具 comfyui_workflows。只使用当前实际可用且符合用户指导的 MCP/skill，不编造工具或预设模型到风格的映射。",
+            "调用 comfyui_txt2img 时，用户指定工作流才传 workflow；未指定时使用下方默认工作流。",
+            "节点输入中的模型文件名是事实线索，不代表已经确认其提示词语法、语言、权重或负面词支持；信息不足时询问用户或查询其指定资料。",
+            json.dumps(self._get_workflow_catalog(), ensure_ascii=False),
+        ]
+        my_prompt = f"{my_prompt}\n\n" + "\n".join(workflow_appendix)
 
         if self.lora_control_enabled and getattr(self, "api", None):
             try:
@@ -968,7 +995,7 @@ class ComfyUIPlugin(Star):
                 lora_appendix = ""
             if lora_appendix:
                 my_prompt = f"{my_prompt}\n\n{lora_appendix}".strip()
-        return my_prompt
+        return my_prompt.strip()
 
     @staticmethod
     def _coerce_conversation_history(raw_history) -> list:
@@ -1171,6 +1198,9 @@ class ComfyUIPlugin(Star):
 
         contexts = self._build_force_draw_contexts(conversation, latest_reply_text)
         base_system_prompt = self._get_comfy_system_prompt()
+        user_system_prompt = event.get_extra("comfy_user_system_prompt") or ""
+        if user_system_prompt:
+            base_system_prompt = f"{user_system_prompt}\n\n{base_system_prompt}"
         latest_reply_excerpt = re.sub(r"\s+", " ", latest_reply_text).strip()
         if len(latest_reply_excerpt) > 1200:
             latest_reply_excerpt = latest_reply_excerpt[:1199].rstrip() + "…"
@@ -1226,7 +1256,7 @@ class ComfyUIPlugin(Star):
                 "下面是最近的一条回复内容：\n"
                 f"{latest_reply_excerpt}\n\n"
                 f"请只基于上面这条最近回复内容，补齐剩余 {remaining_count} 张图。"
-                "只返回对应数量的 <pic prompt=\"...\"> 标签，可按换行分隔。如果有满足动作（如壁屄）或人物要求的lora，则直接使用lora，注意人物一致性"
+                "只返回对应数量的 <pic prompt=\"...\"> 标签，可按换行分隔。LoRA 仅按用户要求和当前工作流的可用信息选择。"
             )
 
             force_draw_instruction = (
@@ -1235,10 +1265,10 @@ class ComfyUIPlugin(Star):
                 f"{existing_prompt_summary}\n"
                 "硬性要求：\n"
                 f"{output_rule}\n"
-                "2. prompt 必须是适合 ComfyUI / Stable Diffusion / Danbooru 的英文 tags，半角逗号分隔；\n"
+                "2. 针对默认工作流的模型编写 prompt；语言、形式、风格遵循用户的人格/系统提示词和本次要求，不预设标签或自然语言格式；\n"
                 f"{count_rule}\n"
                 "4. 只能基于最近的一条回复内容来补图，不要参考更早的整体会话上下文；\n"
-                "5. 如果信息不足，就提炼最近一条回复里最值得定格的不同瞬间；\n"
+                "5. 如果信息不足，就从最近一条回复提炼互不重复且可执行的画面需求；\n"
                 "6. 不要输出占位符，不要留空，不要重复已有画面。"
             )
             system_prompt = (
@@ -1297,6 +1327,7 @@ class ComfyUIPlugin(Star):
 
     async def initialize(self):
         self.context.activate_llm_tool("comfyui_txt2img")
+        self.context.activate_llm_tool("comfyui_workflows")
         self._auto_update_schema()
         self._workflow_schema_watch_task = asyncio.create_task(
             self._watch_workflow_schema(),
@@ -1438,6 +1469,7 @@ class ComfyUIPlugin(Star):
             "",
             "【LLM 模式】",
             "  直接对话：'帮我画一个可爱的猫娘'",
+            "  LLM 可调用 comfyui_workflows 查询 workflow 的模型声明",
             ""
         ]
         
@@ -3368,6 +3400,29 @@ class ComfyUIPlugin(Star):
             event.set_extra(self._BATCH_WAIT_STATE_EXTRA, None)
         return True
 
+    @llm_tool(name="comfyui_workflows")
+    async def comfyui_workflows(self, event: AstrMessageEvent, workflow: str = None) -> str:
+        """只读查询可用 workflow 及各自声明的模型、文本编码器、VAE、LoRA 等文件。
+
+        编写画图提示词前查看目标工作流的模型信息；不提交任务、不切换默认工作流。
+        返回静态模型声明、未解析输入和未知 loader，不保证服务端安装或动态分支。
+        提示词形式、语言、风格和 MCP/skill 建议按用户的人格/系统提示词及本次要求选择，
+        只使用当前可用工具；不能从文件名推定最佳格式或编造模型与风格的对应规则。
+
+        Args:
+            workflow(string): 可选文件名或不带 .json 的名称；省略则列出全部 workflow 及模型。
+        """
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            return reason
+        try:
+            # Workflow JSON reads are small and local; keep this synchronous so
+            # the tool has no executor/thread lifecycle dependency.
+            catalog = self._get_workflow_catalog(workflow)
+            return json.dumps(catalog, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": f"查询 workflow 失败：{e}"}, ensure_ascii=False)
+
     @llm_tool(name="comfyui_txt2img")
     async def comfyui_txt2img(
         self,
@@ -3384,20 +3439,23 @@ class ComfyUIPlugin(Star):
     ) -> MessageEventResult:
         """使用 ComfyUI 生成图片。
 
-        LLM 调用规则：`prompt` 必填，优先使用英文 Danbooru/Stable Diffusion tags，
-        用半角逗号分隔；`negative_prompt` 独立传入，不要把 `--neg` 拼进 prompt。
+        定位为画图提示词编写助手。先通过 comfyui_workflows 或上下文中的模型清单确认目标工作流。
+        `prompt` 的语言、形式和风格，以及提示词 MCP/skill 建议，遵循用户的人格/系统提示词、
+        本次要求和模型资料；只使用实际可用的工具，不预制推荐，也不统一限定标签或自然语言。
+        `negative_prompt` 独立传入，不要把 `--neg` 拼进 prompt。
         `workflow` 可选，只能填系统提供的 workflow 文件名或不带 `.json` 的名称；
         用户未明确指定时省略，不要猜测名称。prompt 可包含
         `<lora picks="...">`，例如 `<lora picks="character.safetensors:0.8@1">`，
         默认最多 4 个（可由 lora_control.max_lora_count 调整）；`@1+2` 表示多个触发词候选，
         `!clear_defaults` 表示清除默认 LoRA。
-        不要对 prompt 做 URL、Base64 或 HTML 实体编码；JSON/XML 调用中的引号、
+        不要对 prompt 做 URL、Base64 或 HTML 实体编码；JSON 调用中的引号、
         反斜杠和换行交给序列化器转义，不要把 `&quot;` 写进 LoRA 标签。
         这是函数调用，不使用 `/画图` 的 `--workflow`、`-wf`、`--neg`、`-n` 语法。
-        工具返回图片或错误信息，不要编造结果；一次最多生成 16 张。
+        工具返回图片、提交状态或错误信息，不要编造结果；一次最多生成 16 张。
+        批量提交成功后由插件继续等待与发送，不要因尚未收到图片而重复调用。
 
         Args:
-            prompt(string): 必填的正向提示词；推荐英文 tags，半角逗号分隔，可包含 LoRA 标签。
+            prompt(string): 正向提示词；形式按用户人格/系统提示词和目标模型资料决定，可包含 LoRA 标签。
             text(string): prompt 为空时的兼容备用字段，一般不传。
             negative_prompt(string): 独立的负向提示词；未传时保留 workflow 内置负面词并追加插件默认词。
             workflow(string): 可选 workflow 文件名或 stem；只能从运行时提供的列表中选择，省略时使用默认 workflow。
