@@ -867,7 +867,7 @@ class ComfyUI:
             f"以下 LoRA 清单属于默认工作流 {self.wf_filename}；不代表其他工作流的模型兼容性。",
             "LoRA 的选择与描述形式遵循用户的人格/系统提示词和当前画图要求。",
             "调用 comfyui_txt2img 时把控制标签放进 prompt 字符串。",
-            "如果当前画面确实需要特定 LoRA，请在对应的 `<pic prompt=\"...\">` 之前额外输出一个标签：",
+            "如果当前画面确实需要特定 LoRA，请在 comfyui_txt2img 的 prompt 字符串前放置一个控制标签：",
             "`<lora picks=\"LoRA名:强度@触发词序号, 另一个LoRA名:强度:clip强度@1+2\">`",
             "",
             f"规则：最多选择 {self.max_lora_count} 个；只能从下面清单里挑；不需要时不要输出 `<lora picks>`。",

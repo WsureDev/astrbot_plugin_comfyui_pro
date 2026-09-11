@@ -61,8 +61,7 @@
 2. JSON 请求中的字符串引号、反斜杠和换行由 JSON 库自动转义。手写 JSON 时，LoRA 标签属性的引号写成 `\"`；工具收到的实际字符串必须是 `<lora picks="...">`。普通 prompt 中的符号不需要额外转码。
 3. 不要把 `&quot;`、`&#34;` 或反斜杠实体写进 LoRA 标签；插件不会把这些实体还原，标签就无法被识别。
 4. LoRA 标签必须使用双引号属性，建议写在 prompt 开头附近，并且内部不要再放未转义的双引号。标签会在提交前剥离，剩余内容才是正向 prompt。
-5. `<pic prompt="...">` 是 LLM 普通回复触发自动绘图的标记，不是 `comfyui_txt2img` 的参数。调用工具时直接传 `prompt`，不要把 `<pic>` 外壳塞进 `prompt`。
-6. 普通 prompt 中保留目标模型需要的符号；换行是否保留由模型资料决定。如果使用 JSON 字符串，交由序列化器处理 `\n`，不要手动重复转义。
+5. 普通 prompt 中保留目标模型需要的符号；换行是否保留由模型资料决定。如果使用 JSON 字符串，交由序列化器处理 `\n`，不要手动重复转义。
 
 ## LoRA 控制
 
@@ -117,7 +116,7 @@
 - **ComfyUI 连接**：`server_address` 指向 ComfyUI 或兼容 gateway 的 HTTP 地址。
 - **工作流设置**：`workflow_settings.json_file` 选择默认 JSON；`input_node_id` 指定正向提示词节点；`neg_node_id` 指定负向提示词节点（可空）；`output_node_id` 指定输出节点。
 - **基础参数**：`sub_config.negative_prompt` 会作为额外负面词追加；`sub_config.steps`、`sub_config.width`、`sub_config.height` 是兼容字段，当前尺寸和步数仍由 workflow 节点及步数 sidecar 决定。
-- **LLM 设置**：`llm_settings.system_prompt` 控制普通对话的绘图规则；默认内容只定义助手职责和协议，不规定模型提示词风格。`environment_prompt` 留空或填写当前实例的模型资料、已安装 MCP/skill 及使用条件，插件不会预置这些内容。插件会追加运行时 workflow 模型列表。`multi_image_mode` 控制 `<pic>` 多图分段，`discard_prompt_from_history` 控制是否从历史丢弃绘图提示词，`force_draw_when_no_prompt` 开启自动补图，`target_image_count` 设置自动补图目标数量。
+- **LLM 设置**：`llm_settings.system_prompt` 控制普通对话的绘图规则；默认内容只定义助手职责和协议，不规定模型提示词风格。`environment_prompt` 留空或填写当前实例的模型资料、已安装 MCP/skill 及使用条件，插件不会预置这些内容。插件会追加运行时 workflow 模型列表。`multi_image_mode` 控制多图分段，`discard_prompt_from_history` 控制是否从历史丢弃绘图提示词，`force_draw_when_no_prompt` 开启自动补图，`target_image_count` 设置自动补图目标数量。
 - **LoRA 控制**：`llm_settings.lora_control.enabled` 开关；`inject_catalog_into_system_prompt` 注入当前 workflow 清单；`inject_selected_prompt_hints` 注入选中触发词；`keep_workflow_defaults_when_selected` 控制是否保留默认 LoRA；`max_lora_count` 控制最多选择数。
 - **输出与权限**：`control` 中的冷却、白名单、管理员和敏感词策略决定谁可以调用工具；这些是部署策略，应在实例配置中设置。
 
