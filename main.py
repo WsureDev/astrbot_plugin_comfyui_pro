@@ -38,7 +38,7 @@ class _ComfyImageMarker:
     "astrbot_plugin_comfyui_pro",  
     "lumingya",                    
     "ComfyUI Pro 连接器",           
-    "1.2.0",
+    "2.4.2",
     "https://github.com/lumingya/astrbot_plugin_comfyui_pro" 
 )
 class ComfyUIPlugin(Star):
@@ -973,28 +973,23 @@ class ComfyUIPlugin(Star):
     def _get_comfy_system_prompt(self) -> str:
         llm_settings = self.config.get("llm_settings", {}) or {}
         my_prompt = (llm_settings.get("system_prompt", "") or "").strip()
-        # Upgrade only the verbatim former built-in default, never custom persona text.
-        if hashlib.sha256(my_prompt.encode("utf-8")).hexdigest() == "3c6284391679aeb398e774aa7df3738cf9c69d92388ffd2f38ced4ceea68a74a":
+        # Upgrade only verbatim built-in defaults, never custom persona text.
+        if hashlib.sha256(my_prompt.encode("utf-8")).hexdigest() in {
+            "3c6284391679aeb398e774aa7df3738cf9c69d92388ffd2f38ced4ceea68a74a",
+            "422e34c432bdba497803f34b726ed426728a56b7f131b44aba95f3f922d0e573",
+        }:
             with (PLUGIN_DIR / "_conf_schema.json").open(encoding="utf-8") as source:
                 my_prompt = json.load(source)["llm_settings"]["items"]["system_prompt"]["default"]
+        api = getattr(self, "api", None)
         workflow_appendix = [
-            "【ComfyUI 画图提示词编写助手：工作流与模型信息】",
-            "以下为插件协议和实例数据；提示词语言、形式、风格、MCP/skill 使用建议遵循用户的人格/系统提示词和本次要求。",
-            "需要确认模型时可调用只读工具 comfyui_workflows。只使用当前实际可用且符合用户指导的 MCP/skill，不编造工具或预设模型到风格的映射。",
-            "调用 comfyui_txt2img 时，用户指定工作流才传 workflow；未指定时使用下方默认工作流。",
-            "节点输入中的模型文件名是事实线索，不代表已经确认其提示词语法、语言、权重或负面词支持；信息不足时询问用户或查询其指定资料。",
-            json.dumps(self._get_workflow_catalog(), ensure_ascii=False),
+            "【ComfyUI 工具入口】",
+            "仅在本轮已选择 ComfyUI 生图时使用；遵循用户的人格、后端选择和确认要求。",
+            "comfyui_usage：按需读取参数、LoRA 控制语法和失败处理说明。",
+            "comfyui_workflows：按需查询工作流、模型声明和实例补充说明。",
+            f"默认 workflow：{getattr(api, 'wf_filename', '') or '未配置'}；用户未指定时省略 workflow 参数。",
+            "LoRA 搜索、详情及管理使用实际可用的 LoRA MCP；本插件不自动注入库存清单。",
         ]
         my_prompt = f"{my_prompt}\n\n" + "\n".join(workflow_appendix)
-
-        if self.lora_control_enabled and getattr(self, "api", None):
-            try:
-                lora_appendix = self.api.get_lora_prompt_appendix()
-            except Exception as e:
-                logger.warning(f"[ComfyUI] 获取 LoRA prompt 附录失败: {e}")
-                lora_appendix = ""
-            if lora_appendix:
-                my_prompt = f"{my_prompt}\n\n{lora_appendix}".strip()
         return my_prompt.strip()
 
     @staticmethod
@@ -1198,6 +1193,13 @@ class ComfyUIPlugin(Star):
 
         contexts = self._build_force_draw_contexts(conversation, latest_reply_text)
         base_system_prompt = self._get_comfy_system_prompt()
+        # This direct provider call has no discovery tools. Supply only its
+        # target workflow, never the full workflow or runtime LoRA catalogs.
+        default_workflow = getattr(getattr(self, "api", None), "wf_filename", "")
+        if default_workflow:
+            base_system_prompt += "\n\n本次补图使用的默认工作流资料：\n" + json.dumps(
+                self._get_workflow_catalog(default_workflow), ensure_ascii=False,
+            )
         user_system_prompt = event.get_extra("comfy_user_system_prompt") or ""
         if user_system_prompt:
             base_system_prompt = f"{user_system_prompt}\n\n{base_system_prompt}"
@@ -1328,6 +1330,7 @@ class ComfyUIPlugin(Star):
     async def initialize(self):
         self.context.activate_llm_tool("comfyui_txt2img")
         self.context.activate_llm_tool("comfyui_workflows")
+        self.context.activate_llm_tool("comfyui_usage")
         self._auto_update_schema()
         self._workflow_schema_watch_task = asyncio.create_task(
             self._watch_workflow_schema(),
@@ -3400,6 +3403,39 @@ class ComfyUIPlugin(Star):
             event.set_extra(self._BATCH_WAIT_STATE_EXTRA, None)
         return True
 
+    @llm_tool(name="comfyui_usage")
+    async def comfyui_usage(self, event: AstrMessageEvent) -> str:
+        """只读获取 ComfyUI 生图工具用法、当前 LoRA 开关和数量限制。
+
+        首次使用 comfyui_txt2img，或不确定参数、LoRA 标签、负面词、批量和发送方式时调用。
+        返回随插件发布的使用说明，不生图、不扫描 LoRA 库存、不下载、不修改配置。
+        工作流模型信息用 comfyui_workflows 查询；LoRA 搜索与管理使用实际可用的 LoRA MCP。
+        """
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            return reason
+        try:
+            usage = (PLUGIN_DIR / "docs" / "comfyui_txt2img_tool.md").read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(f"[ComfyUI] 读取工具使用说明失败: {e}")
+            return "ComfyUI 使用说明文件缺失或不可读，请检查插件安装是否包含 docs/comfyui_txt2img_tool.md。"
+
+        api = getattr(self, "api", None)
+        runtime = {
+            "api_initialized": api is not None,
+            "default_workflow": getattr(api, "wf_filename", None),
+            "lora_control_enabled": getattr(api, "lora_control_enabled", False),
+            "max_lora_count": getattr(api, "max_lora_count", None),
+            "inject_selected_prompt_hints": getattr(api, "inject_selected_lora_hints", False),
+            "keep_workflow_defaults_when_selected": getattr(api, "keep_workflow_defaults_when_selected", None),
+            "catalog_in_system_prompt": False,
+        }
+        return (
+            "当前实例状态（优先于下文中的默认值；API 未初始化时不能提交生图）：\n"
+            + json.dumps(runtime, ensure_ascii=False)
+            + "\n\n" + usage
+        )
+
     @llm_tool(name="comfyui_workflows")
     async def comfyui_workflows(self, event: AstrMessageEvent, workflow: str = None) -> str:
         """只读查询可用 workflow 及各自声明的模型、文本编码器、VAE、LoRA 等文件。
@@ -3439,7 +3475,8 @@ class ComfyUIPlugin(Star):
     ) -> MessageEventResult:
         """使用 ComfyUI 生成图片。
 
-        定位为画图提示词编写助手。先通过 comfyui_workflows 或上下文中的模型清单确认目标工作流。
+        仅在本轮已选择 ComfyUI 时调用。用法不明确时先调用只读工具 comfyui_usage；
+        通过 comfyui_workflows 确认目标工作流及模型资料。
         `prompt` 的语言、形式和风格，以及提示词 MCP/skill 建议，遵循用户的人格/系统提示词、
         本次要求和模型资料；只使用实际可用的工具，不预制推荐，也不统一限定标签或自然语言。
         `negative_prompt` 独立传入，不要把 `--neg` 拼进 prompt。

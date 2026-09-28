@@ -46,6 +46,7 @@
 *   **指令生图**: 为高级用户保留了传统的 `/画图` 指令，可直接传入目标模型所需的提示词格式。
 *   **高度可定制**: 你可以随时在后台修改 System Prompt，定制你的“AI 绘画助手”人设和回复风格。
 *   **模型感知提示词**: LLM 可通过 `comfyui_workflows` 读取各 workflow 的静态模型声明，再结合用户 System Prompt 和实例补充配置决定提示词形式。
+*   **按需用法说明**: `comfyui_usage` 只读返回参数、LoRA 控制和当前实例限制；不再自动注入全量 LoRA 或工作流模型清单，LoRA 库存查询与管理交给实际可用的 LoRA MCP。
 *   **工具调用**: 需要出图时使用 `comfyui_txt2img`，提示词格式由目标模型资料和用户系统提示词决定。
   
 ### 🛡️ 完善的风控与权限
@@ -84,7 +85,13 @@
 
 ### LLM 工具详细说明
 
-`comfyui_txt2img` 的参数、workflow 选择、LoRA 标签和 JSON/XML 转义规则见 [docs/comfyui_txt2img_tool.md](docs/comfyui_txt2img_tool.md)。该文档与工具函数 docstring 同步维护，适合作为模型调用速查。
+`comfyui_txt2img` 的参数、workflow 选择、LoRA 标签和 JSON/XML 转义规则见 [docs/comfyui_txt2img_tool.md](docs/comfyui_txt2img_tool.md)。LLM 可调用无参数的 `comfyui_usage` 按需读取同一份文档，并获得当前实例的 LoRA 开关和数量限制。
+
+### 2.4.2 升级说明
+
+- 全量 LoRA 注入已停用：历史 `inject_catalog_into_system_prompt=true` 也不会恢复注入；自定义系统提示词继续保留，完全匹配旧内置默认值的文本会在组装时升级。
+- 工作流模型和实例补充说明改由 `comfyui_workflows` 按需提供；说明文档由 `comfyui_usage` 提供。部署时请包含仓库中的 `docs/` 和 `workflow_info.py`，并重载插件以注册工具。
+- LoRA 搜索和管理使用实际可用的 LoRA MCP；现有本地名称解析、禁用检查和选中触发词注入继续用于执行。不要直接清空 `scan_directories` 或关闭 LoRA 执行开关。
 
 ### 方式一：自然语言对话 (推荐)
 直接与机器人对话，让它帮你画。

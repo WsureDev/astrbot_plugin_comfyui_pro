@@ -1,10 +1,20 @@
 # `comfyui_txt2img` 使用说明
 
-这份说明同时面向项目维护者和会调用 AstrBot 工具的 LLM。工具的真实签名以 `main.py` 中的 `comfyui_txt2img` 为准；本文解释参数、提示词格式、编码规则和常见错误。
+这份说明同时面向项目维护者和会调用 AstrBot 工具的 LLM。`comfyui_usage` 会按需读取本文件，并附上当前实例的 LoRA 开关和数量限制。工具的真实签名以 `main.py` 中的 `comfyui_txt2img` 为准。
 
 ## 一句话
 
-需要出图时调用 `comfyui_txt2img`。先确认目标 workflow 声明的模型和编码器，再按照用户的人格／系统提示词、模型资料和本次需求决定 prompt 的语言、结构与风格。把正向内容放进 `prompt`，负面内容放进 `negative_prompt`；只有用户明确指定且名称在可用列表中时才传 `workflow`。
+本轮已按用户要求选择 ComfyUI 后，调用 `comfyui_txt2img`；遵循已有的生图后端优先级和确认要求。先确认目标 workflow 声明的模型和编码器，再按照用户的人格／系统提示词、模型资料和本次需求决定 prompt 的语言、结构与风格。把正向内容放进 `prompt`，负面内容放进 `negative_prompt`；只有用户明确指定且名称在可用列表中时才传 `workflow`。
+
+## 按需查询入口
+
+- `comfyui_usage`：无参数，只读返回本说明及当前实例状态；不扫描 LoRA 库存、不生图、不下载、不修改配置。
+- `comfyui_workflows`：只读查询工作流模型声明及 `environment_prompt` 实例补充说明；已知目标名称时传 `workflow`，省略则列全部工作流。
+- LoRA 的搜索、详情、下载和启停由独立的 LoRA MCP 负责。若当前工具集中提供 `search_local_inventory`、`get_local_lora_details`，可使用它们查询已安装条目；这些不是本插件注册的工具。只能调用本轮实际可用的工具。
+
+插件不再将全量 LoRA 清单或全部工作流模型 JSON 自动拼进 system prompt。`comfyui_workflows` 中的 LoRA 仅是工作流模板内已启用的声明，不是本地库存查询。
+
+若实例另外开启自动补图，补图的独立请求仅携带默认工作流的模型资料和实例补充说明，不携带全部工作流或 LoRA 库存。
 
 ## 工具参数
 
@@ -65,11 +75,11 @@
 
 ## LoRA 控制
 
-当当前 workflow 开启 LoRA 控制并提供可用清单时，使用：
+先通过当前可用的 LoRA MCP 确认本地已安装的模型、名称和适用条件，再在开启 LoRA 控制的 workflow 中使用。查询到远端模型不代表已经安装。以下名称只是语法示例，不能直接照抄提交：
 
 ```json
 {
-  "prompt": "<lora picks=\"character.safetensors:0.8@1, style.safetensors:0.5\"> 1girl, standing, city street",
+  "prompt": "<lora picks=\"character.safetensors:0.8, style.safetensors:0.5\"> 1girl, standing, city street",
   "negative_prompt": "lowres, bad hands",
   "direct_send": true
 }
@@ -83,10 +93,10 @@
 
 - 默认最多选择 4 个 LoRA；可通过 `llm_settings.lora_control.max_lora_count` 调整上限。
 - 强度会按数值解析；建议使用 `0.0`–`2.0` 的小数，具体以当前工作流和模型效果为准。
-- `@1` 选择第 1 个触发词候选，`@1+2` 同时选择第 1、2 个候选；省略 `@...` 则使用默认提示词候选。
+- `@1` 选择插件解析出的第 1 个触发词候选，`@1+2` 同时选择第 1、2 个候选。仅在已确认候选编号时使用；不要把 MCP 搜索排名当作候选编号。省略 `@...` 时使用配置的 `prompt_hints`，或唯一的触发词候选；多个候选不会自动全选。
 - `!clear_defaults` 是控制项，用于本次请求清除工作流中原本启用的默认 LoRA：`<lora picks="!clear_defaults, character.safetensors:0.8">`。
-- 选中的 LoRA 可能自动注入其提示词提示；不要重复手写同一组触发词。
-- 名称必须来自当前 workflow 的清单。找不到时插件会跳过该项，不要假设任意磁盘文件名都可用。
+- 是否自动注入选中的触发词、是否保留默认 LoRA，以 `comfyui_usage` 返回的当前实例状态为准；自动注入关闭时需要自行编写完整提示词。不要重复手写同一组已自动注入的触发词。
+- 使用 MCP 确认的 ComfyUI 相对文件名或已知别名，不传下载 URL。当前执行端仍通过 workflow、本地文件和 sidecar 做兼容解析；找不到时会跳过该项，不能假设任意名称都有效。关闭全量注入不会关闭这条执行路径。
 
 ## `/画图` 命令与工具调用的区别
 
@@ -116,13 +126,13 @@
 - **ComfyUI 连接**：`server_address` 指向 ComfyUI 或兼容 gateway 的 HTTP 地址。
 - **工作流设置**：`workflow_settings.json_file` 选择默认 JSON；`input_node_id` 指定正向提示词节点；`neg_node_id` 指定负向提示词节点（可空）；`output_node_id` 指定输出节点。
 - **基础参数**：`sub_config.negative_prompt` 会作为额外负面词追加；`sub_config.steps`、`sub_config.width`、`sub_config.height` 是兼容字段，当前尺寸和步数仍由 workflow 节点及步数 sidecar 决定。
-- **LLM 设置**：`llm_settings.system_prompt` 控制普通对话的绘图规则；默认内容只定义助手职责和协议，不规定模型提示词风格。`environment_prompt` 留空或填写当前实例的模型资料、已安装 MCP/skill 及使用条件，插件不会预置这些内容。插件会追加运行时 workflow 模型列表。`multi_image_mode` 控制多图分段，`discard_prompt_from_history` 控制是否从历史丢弃绘图提示词，`force_draw_when_no_prompt` 开启自动补图，`target_image_count` 设置自动补图目标数量。
-- **LoRA 控制**：`llm_settings.lora_control.enabled` 开关；`inject_catalog_into_system_prompt` 注入当前 workflow 清单；`inject_selected_prompt_hints` 注入选中触发词；`keep_workflow_defaults_when_selected` 控制是否保留默认 LoRA；`max_lora_count` 控制最多选择数。
+- **LLM 设置**：`llm_settings.system_prompt` 补充绘图规则，插件保留自定义内容；自动附录仅提供简短工具入口和默认工作流名称。`environment_prompt` 可填写模型资料、已安装 MCP/skill 及使用条件，通过 `comfyui_workflows` 按需返回。`multi_image_mode` 控制多图分段，`discard_prompt_from_history` 控制是否从历史丢弃绘图提示词，`force_draw_when_no_prompt` 开启自动补图，`target_image_count` 设置自动补图目标数量。
+- **LoRA 控制**：`llm_settings.lora_control.enabled` 保留执行控制；`inject_catalog_into_system_prompt` 已停用，旧配置即使为 `true` 也不会重新开启全量注入。`inject_selected_prompt_hints` 控制最终绘图 prompt 中的选中触发词，与 system prompt 的清单注入不同；`keep_workflow_defaults_when_selected` 控制是否保留默认 LoRA；`max_lora_count` 控制最多选择数。迁移阶段保留 `scan_directories` 和现有执行解析，不要因关闭注入而清空它们。
 - **输出与权限**：`control` 中的冷却、白名单、管理员和敏感词策略决定谁可以调用工具；这些是部署策略，应在实例配置中设置。
 
 ### 工作流文件和运行时列表
 
-将 ComfyUI 的 **Save (API Format)** JSON 放入插件持久化数据目录的 `workflow/` 子目录，并在插件配置中选择它。插件启动时扫描 JSON，运行时把可用文件名注入 LLM 上下文；切换 workflow 时会按文件名或 stem 重新加载对应 JSON。项目仓库中的 `workflow/` 仅用于默认模板，具体实例文件属于部署数据。
+将 ComfyUI 的 **Save (API Format)** JSON 放入插件持久化数据目录的 `workflow/` 子目录，并在插件配置中选择它。可用文件名和模型资料通过 `comfyui_workflows` 按需查询；切换 workflow 时会按文件名或 stem 重新加载对应 JSON。项目仓库中的 `workflow/` 仅用于默认模板，具体实例文件属于部署数据。
 
 ### 管理命令
 
@@ -130,9 +140,9 @@
 
 ## LLM 速查
 
-1. 先判断用户是否真的要出图；需要时先确认 workflow 和模型信息。
+1. 先确认用户确实需要出图，且本轮已选择 ComfyUI；首次使用或参数不明确时调用 `comfyui_usage`。
 2. 信息不足时调用 `comfyui_workflows`，再按用户人格／系统提示词、`environment_prompt` 和模型资料决定 prompt 形式；不要预设标签或语言。
 3. `negative_prompt` 独立传入；用户明确给出 workflow 且名称在列表中时才传 `workflow`，否则省略。
-4. 需要 LoRA 时只使用 `<lora picks="...">`，不要 HTML/URL 编码；选择依据来自当前清单和用户要求。
+4. 需要 LoRA 时先通过实际可用的 LoRA MCP 查询，再使用 `<lora picks="...">`；不要编造名称或候选编号，不要 HTML/URL 编码。
 5. JSON 的引号交给序列化器转义；不要把 `/画图` 的命令行选项混入工具参数。
 6. 根据工具真实返回说明成功、失败或部分成功。

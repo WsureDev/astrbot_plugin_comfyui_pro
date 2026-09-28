@@ -136,7 +136,9 @@ class ComfyUI:
         llm_conf = config.get("llm_settings", {}) or {}
         lora_conf = llm_conf.get("lora_control", {}) or {}
         self.lora_control_enabled = bool(lora_conf.get("enabled", False))
-        self.inject_lora_catalog = bool(lora_conf.get("inject_catalog_into_system_prompt", True))
+        # Deprecated compatibility flag: persisted True must not restore bulk injection.
+        # Local resolution remains available to execute LoRAs selected through MCP.
+        self.inject_lora_catalog = False
         self.inject_selected_lora_hints = bool(lora_conf.get("inject_selected_prompt_hints", True))
         self.keep_workflow_defaults_when_selected = bool(
             lora_conf.get("keep_workflow_defaults_when_selected", True)
@@ -850,110 +852,8 @@ class ComfyUI:
         return context
 
     def get_lora_prompt_appendix(self) -> str:
-        if not (self.lora_control_enabled and self.inject_lora_catalog):
-            return ""
-
-        context = self.get_lora_runtime_context()
-        catalog = context.get("catalog", {})
-        if not context.get("supported") or not catalog:
-            return ""
-
-        default_loras = context.get("default_active_loras", [])
-        lines = [
-            "--------------------------------------------------",
-            "【可选 LoRA 堆控制】",
-            "--------------------------------------------------",
-            "",
-            f"以下 LoRA 清单属于默认工作流 {self.wf_filename}；不代表其他工作流的模型兼容性。",
-            "LoRA 的选择与描述形式遵循用户的人格/系统提示词和当前画图要求。",
-            "调用 comfyui_txt2img 时把控制标签放进 prompt 字符串。",
-            "如果当前画面确实需要特定 LoRA，请在 comfyui_txt2img 的 prompt 字符串前放置一个控制标签：",
-            "`<lora picks=\"LoRA名:强度@触发词序号, 另一个LoRA名:强度:clip强度@1+2\">`",
-            "",
-            f"规则：最多选择 {self.max_lora_count} 个；只能从下面清单里挑；不需要时不要输出 `<lora picks>`。",
-            f"如果想只在本次图片里禁用工作流默认 LoRA，请输出：`<lora picks=\"{LORA_CLEAR_DEFAULTS_TOKEN}\">`。",
-            f"如果想禁用默认 LoRA 后改用别的 LoRA，请输出：`<lora picks=\"{LORA_CLEAR_DEFAULTS_TOKEN}, LoRA名:0.8@1\">`。",
-            "这里的 `@1`、`@1+2` 表示使用该 LoRA 下方列出来的第 1 个或第 1+2 个触发词候选。",
-            "缺少触发词候选不代表该 LoRA 属于某种风格或兼容任意模型，需以用户提供的模型资料为准。",
-            f"选中触发词自动注入开关：{'开启' if self.inject_selected_lora_hints else '关闭'}。开启时 `@序号` 对应的候选会注入最终 prompt。",
-            "自动注入开启时，prompt 只需补充触发词未覆盖的画面需求；关闭时根据用户要求自行编写完整提示词。",
-            "",
-        ]
-
-        if default_loras:
-            lines.append("当前工作流默认启用的 LoRA：")
-            for entry in default_loras:
-                strength_text = self._format_lora_strength(entry.get("default_strength", 1.0))
-                clip_text = self._format_lora_strength(
-                    entry.get("default_clip_strength", entry.get("default_strength", 1.0))
-                )
-                lines.append(f"- {entry['display_name']} | default_on={strength_text}/{clip_text}")
-        else:
-            lines.append("当前工作流默认启用的 LoRA：无")
-
-        lines.extend(["", "当前可用 LoRA 清单："])
-        for entry in catalog.values():
-            strength_text = self._format_lora_strength(entry.get("default_strength", 1.0))
-            clip_strength = entry.get("default_clip_strength", entry.get("default_strength", 1.0))
-            clip_text = self._format_lora_strength(clip_strength)
-            default_flag = "on" if entry.get("default_active") else "off"
-            alias_values = [
-                alias
-                for alias in entry.get("aliases", [])
-                if self._normalize_lora_key(alias) != self._normalize_lora_key(entry.get("display_name"))
-            ]
-            alias_preview = ", ".join(alias_values[:2])
-            trigger_options = entry.get("trigger_options", [])[: self.max_trigger_options_per_lora]
-            trigger_preview = " ; ".join(
-                f"[{idx}] {self._trim_preview_text(option, self.trigger_option_preview_length)}"
-                for idx, option in enumerate(trigger_options, start=1)
-            )
-
-            details = [f"default={default_flag}:{strength_text}/{clip_text}"]
-            if alias_preview:
-                details.append(f"aliases={alias_preview}")
-            if entry.get("model_name"):
-                details.append(f"model={self._trim_preview_text(entry['model_name'], 48)}")
-            if entry.get("base_model"):
-                details.append(f"base={entry['base_model']}")
-            if trigger_preview:
-                details.append(f"triggers={trigger_preview}")
-            elif entry.get("prompt_hints"):
-                details.append(
-                    "hints="
-                    + " ; ".join(
-                        self._trim_preview_text(text, self.trigger_option_preview_length)
-                        for text in entry.get("prompt_hints", [])[: self.max_trigger_options_per_lora]
-                    )
-                )
-            elif entry.get("is_style_lora"):
-                details.append("triggers=无（更偏全局风格）")
-            else:
-                details.append("triggers=无")
-            if entry.get("description"):
-                details.append(f"note={self._trim_preview_text(entry['description'], 60)}")
-            lines.append(f"- {entry['display_name']} | " + " | ".join(details))
-
-        manifest_path = context.get("manifest_path")
-        if manifest_path or context.get("scan_roots"):
-            lines.extend(
-                [
-                    "",
-                ]
-            )
-        if context.get("scan_roots"):
-            lines.append("LoRA 扫描根目录：")
-            for root in context.get("scan_roots", []):
-                lines.append(f"- {root}")
-        if manifest_path:
-            lines.extend(
-                [
-                    f"工作流 sidecar 元数据文件：{manifest_path}",
-                    "如果某个 LoRA 有额外 aliases、trigger_words、prompt_hints、description，请按这些信息理解。",
-                ]
-            )
-
-        return "\n".join(lines).strip()
+        """Legacy entry point; bulk catalog injection is retired, including saved True."""
+        return ""
 
     def resolve_lora_selections(self, selections, workflow_filename: str = None) -> list:
         if not selections:
