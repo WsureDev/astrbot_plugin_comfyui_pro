@@ -71,12 +71,6 @@
         "default": 1,
         "hint": "设为 1 时保持原有行为；设为大于 1 时，插件会按多图方式依次发送图片。只有在自动补图开关开启时，才会按这个数量补齐"
       },
-      "system_prompt": {
-        "description": "画图提示词编写助手的补充指令",
-        "type": "text",
-        "hint": "补充插件使用约定；遵循用户的人格、后端选择和确认要求。详细用法由 comfyui_usage 按需提供，不注入库存清单。",
-        "default": "【ComfyUI 使用约定】\n仅在本轮按用户要求选择 ComfyUI 时调用 comfyui_txt2img；遵循已有后端优先级和确认要求。\n用法查询 comfyui_usage；工作流及模型资料查询 comfyui_workflows；LoRA 搜索、详情、下载和管理使用本轮实际可用的 LoRA MCP。\n提示词遵循用户的人格、本次要求和目标模型资料；不编造工具、模型能力或 LoRA 名称。\n用户未要求出图时不提交；只根据工具真实结果报告状态，批量提交后不重复提交。"
-      },
       "environment_prompt": {
         "description": "本实例的模型与提示词工具补充说明",
         "type": "text",

@@ -70,7 +70,7 @@
 *   `Output Node ID`: **(核心)** 输出图片的节点 ID 。
 
 ### 3. LLM 设置 (LLM Settings)
-*   `System Prompt`: 在这里编辑给 LLM 的系统提示词，定义它如何响应用户的画图请求。
+*   插件不再向 LLM 系统提示词追加工具说明；绘图规则由用户的人格／系统提示词决定，详细用法通过 `comfyui_usage` 按需读取。
 
 ### 4. 访问控制 (Control)
 *   **管理员与白名单**: 设置管理员 QQ 号和允许使用插件的群号。
@@ -87,10 +87,12 @@
 
 `comfyui_txt2img` 的参数、workflow 选择、LoRA 标签和 JSON/XML 转义规则见 [docs/comfyui_txt2img_tool.md](docs/comfyui_txt2img_tool.md)。LLM 可调用无参数的 `comfyui_usage` 按需读取同一份文档，并获得当前实例的 LoRA 开关和数量限制。
 
+`comfy_record` 按平台实例及群聊／私聊保存最近 20 次实际发往 `/prompt` 的完整 JSON 请求，包括注入正负提示词、LoRA、随机种子后的 workflow。所有绘图入口自动记录，每次提交占一条，与 `comfy_history` 无关；队满自动淘汰最旧记录。`action="list"`（默认）按从旧到新返回全部记录；`action="pop", count=1` 取出并删除最旧的一条，`count` 支持 1～20。记录跨 `/new` 保留，插件重启后清空；提交失败的尝试也会记录，记录本身不代表出图成功。
+
 ### 2.4.2 升级说明
 
-- 全量 LoRA 注入已停用：历史 `inject_catalog_into_system_prompt=true` 也不会恢复注入；自定义系统提示词继续保留，完全匹配旧内置默认值的文本会在组装时升级。
-- 工作流模型和实例补充说明改由 `comfyui_workflows` 按需提供；说明文档由 `comfyui_usage` 提供。部署时请包含仓库中的 `docs/` 和 `workflow_info.py`，并重载插件以注册工具。
+- 工具说明及插件 `llm_settings.system_prompt` 注入已移除；历史配置中的该字段不再使用。历史 `inject_catalog_into_system_prompt=true` 也不会恢复全量 LoRA 注入。
+- 工作流模型和实例补充说明改由 `comfyui_workflows` 按需提供；说明文档由 `comfyui_usage` 提供。部署时请包含仓库中的 `docs/`、`workflow_info.py` 和 `channel_state.py`，并重载插件以注册工具。
 - LoRA 搜索和管理使用实际可用的 LoRA MCP；现有本地名称解析、禁用检查和选中触发词注入继续用于执行。不要直接清空 `scan_directories` 或关闭 LoRA 执行开关。
 
 ### 方式一：自然语言对话 (推荐)
@@ -114,7 +116,7 @@
 *   `/comfy_ls`: 列出所有可用的工作流，并显示序号。
 *   `/comfy_use <序号> [input_id] [output_id]`: 通过序号快速切换工作流，该方法不需要重载插件。
 *   `/comfy_lock on|off|status`: 动态查看或切换全局锁定状态。
-*   `/comfy_history on|off|status`: 当全局启用“丢弃绘图提示词历史”时，管理员可为当前会话临时保留提示词；使用 `/new` 后自动关闭。
+*   `/comfy_history on|off|status`: 管理员为当前群聊／私聊设置提示词历史保留开关；同群成员共享，跨 `/new` 和插件重启保留。关闭时遵循全局清理策略；开关保存在插件数据目录的 `history_channels.json`。
 *   `/违禁级别 <none/lite/full>`: 调整当前群的敏感词拦截等级。
 *   `/comfy帮助`: 查看所有可用指令。
 

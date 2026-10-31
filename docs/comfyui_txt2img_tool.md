@@ -10,9 +10,10 @@
 
 - `comfyui_usage`：无参数，只读返回本说明及当前实例状态；不扫描 LoRA 库存、不生图、不下载、不修改配置。
 - `comfyui_workflows`：只读查询工作流模型声明及 `environment_prompt` 实例补充说明；已知目标名称时传 `workflow`，省略则列全部工作流。
+- `comfy_record`：查看或先进先出取出当前群聊／私聊最近 20 次提交的完整请求，见下文“渠道绘图记录”。
 - LoRA 的搜索、详情、下载和启停由独立的 LoRA MCP 负责。若当前工具集中提供 `search_local_inventory`、`get_local_lora_details`，可使用它们查询已安装条目；这些不是本插件注册的工具。只能调用本轮实际可用的工具。
 
-插件不再将全量 LoRA 清单或全部工作流模型 JSON 自动拼进 system prompt。`comfyui_workflows` 中的 LoRA 仅是工作流模板内已启用的声明，不是本地库存查询。
+插件不再向 system prompt 追加工具说明、插件自定义 `llm_settings.system_prompt`、全量 LoRA 清单或全部工作流模型 JSON。`comfyui_workflows` 中的 LoRA 仅是工作流模板内已启用的声明，不是本地库存查询。
 
 若实例另外开启自动补图，补图的独立请求仅携带默认工作流的模型资料和实例补充说明，不携带全部工作流或 LoRA 库存。
 
@@ -126,7 +127,7 @@
 - **ComfyUI 连接**：`server_address` 指向 ComfyUI 或兼容 gateway 的 HTTP 地址。
 - **工作流设置**：`workflow_settings.json_file` 选择默认 JSON；`input_node_id` 指定正向提示词节点；`neg_node_id` 指定负向提示词节点（可空）；`output_node_id` 指定输出节点。
 - **基础参数**：`sub_config.negative_prompt` 会作为额外负面词追加；`sub_config.steps`、`sub_config.width`、`sub_config.height` 是兼容字段，当前尺寸和步数仍由 workflow 节点及步数 sidecar 决定。
-- **LLM 设置**：`llm_settings.system_prompt` 补充绘图规则，插件保留自定义内容；自动附录仅提供简短工具入口和默认工作流名称。`environment_prompt` 可填写模型资料、已安装 MCP/skill 及使用条件，通过 `comfyui_workflows` 按需返回。`multi_image_mode` 控制多图分段，`discard_prompt_from_history` 控制是否从历史丢弃绘图提示词，`force_draw_when_no_prompt` 开启自动补图，`target_image_count` 设置自动补图目标数量。
+- **LLM 设置**：绘图规则遵循用户的人格／系统提示词；旧 `llm_settings.system_prompt` 不再使用。`environment_prompt` 可填写模型资料、已安装 MCP/skill 及使用条件，通过 `comfyui_workflows` 按需返回。`multi_image_mode` 控制多图分段，`discard_prompt_from_history` 控制是否从历史丢弃绘图提示词，`force_draw_when_no_prompt` 开启自动补图，`target_image_count` 设置自动补图目标数量。
 - **LoRA 控制**：`llm_settings.lora_control.enabled` 保留执行控制；`inject_catalog_into_system_prompt` 已停用，旧配置即使为 `true` 也不会重新开启全量注入。`inject_selected_prompt_hints` 控制最终绘图 prompt 中的选中触发词，与 system prompt 的清单注入不同；`keep_workflow_defaults_when_selected` 控制是否保留默认 LoRA；`max_lora_count` 控制最多选择数。迁移阶段保留 `scan_directories` 和现有执行解析，不要因关闭注入而清空它们。
 - **输出与权限**：`control` 中的冷却、白名单、管理员和敏感词策略决定谁可以调用工具；这些是部署策略，应在实例配置中设置。
 
@@ -137,6 +138,19 @@
 ### 管理命令
 
 管理员可以使用 `/comfy_ls` 查看运行时列表，使用 `/comfy_use <序号> [input_id] [output_id]` 热切换默认 workflow，使用 `/当前工作流` 查看当前设置。命令切换只改变当前插件实例状态，不会改变本文档或仓库模板。
+
+`/comfy_history on|off|status` 为当前渠道（平台实例内的群聊／私聊）设置历史保留开关，同群成员共用。开关保存在插件数据目录，跨 `/new` 和插件重启保留；无需已有 LLM 会话即可设置。开启时跳过绘图提示词的历史清理，关闭时遵循全局 `discard_prompt_from_history` 设置。
+
+## 渠道绘图记录
+
+`comfy_record` 自动保存当前渠道最近 20 次实际发往 ComfyUI `/prompt` 的请求，与历史清理及 `comfy_history` 开关无关。工具调用、聊天命令、自动绘图和多图批量均会记录，每次提交占一条；队满时自动淘汰最旧记录。
+
+- `action="list"`（默认）：只读返回全部记录，顺序从旧到新。
+- `action="pop", count=1`：从队首取出并删除最旧记录；`count` 可为 1～20，剩余不足时返回全部剩余记录。
+
+返回的 `records` 每条包含 `record_id`、`submitted_at`（Unix 秒）、`user_id`、`workflow`、`url` 和 `request`。其中 `request` 是完整 HTTP JSON 请求体，包含 `client_id` 和全部 workflow 节点；正负提示词、LoRA、触发词、随机种子及其他节点参数均为提交时的最终值，不截断。可用于检查或复用参数，工具本身不会再次提交绘图。
+
+记录按平台实例及群聊／私聊隔离，同群成员共用；跨 `/new` 保留，插件重启清空。被服务端拒绝或网络失败的提交尝试也记录；在本地检查阶段被阻止、未发起 HTTP 提交的请求不记录。记录存在不代表成功出图。
 
 ## LLM 速查
 

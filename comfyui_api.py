@@ -5,6 +5,7 @@ import random
 import re
 import time
 from pathlib import Path
+from typing import Callable
 
 import aiohttp
 import requests
@@ -1356,6 +1357,7 @@ class ComfyUI:
         lora_selections=None,
         negative_prompt=None,
         workflow_filename: str = None,
+        on_submit: Callable[[str, dict], None] | None = None,
     ):
         """Submit a workflow and return its prompt ID without waiting for completion."""
         client_id = str(random.randint(100000, 999999))
@@ -1386,6 +1388,8 @@ class ComfyUI:
         async with aiohttp.ClientSession() as session:
             payload = {"prompt": workflow, "client_id": client_id}
             try:
+                if on_submit is not None:
+                    on_submit(resolved_filename, payload)
                 async with session.post(f"{self.url}/prompt", json=payload) as resp:
                     if resp.status != 200:
                         raw_error = await resp.text()
@@ -1477,6 +1481,7 @@ class ComfyUI:
         lora_selections=None,
         negative_prompt=None,
         workflow_filename: str = None,
+        on_submit: Callable[[str, dict], None] | None = None,
     ):
         """Submit a workflow, wait for completion, and return its first image."""
         prompt_id, error_msg = await self.submit(
@@ -1484,6 +1489,7 @@ class ComfyUI:
             lora_selections=lora_selections,
             negative_prompt=negative_prompt,
             workflow_filename=workflow_filename,
+            on_submit=on_submit,
         )
         if not prompt_id:
             return None, error_msg

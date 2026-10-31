@@ -9,8 +9,8 @@ import asyncio
 import copy
 import shlex
 import random
-import hashlib
 from pathlib import Path
+from .channel_state import ChannelState
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, ResultContentType
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import *
@@ -102,7 +102,7 @@ class ComfyUIPlugin(Star):
         logger.info(f"[ComfyUI] 🖼️ 多图模式: {'开启' if self.multi_image_mode else '关闭'}")
         
         self.discard_prompt_from_history = llm_settings.get("discard_prompt_from_history", False)
-        self._prompt_history_keep_conversations = {}
+        self.channel_state = ChannelState(self.data_dir / "history_channels.json")
         self.force_draw_when_no_prompt = bool(llm_settings.get("force_draw_when_no_prompt", False))
         self.target_image_count = self._coerce_target_image_count(
             llm_settings.get("target_image_count", 1),
@@ -592,25 +592,10 @@ class ComfyUIPlugin(Star):
         logger.info("[ComfyUI] 已向本轮 LLM 请求注入最近绘图失败状态")
 
     @filter.on_llm_request(priority=100)
-    async def inject_system_prompt(self, event: AstrMessageEvent, req):
-        """注入系统提示词 + 清理历史中的绘图提示词"""
-        try:
-            # Keep the incoming persona/system instructions for supplemental requests,
-            # which call the provider directly and bypass AstrBot's persona assembly.
-            if event.get_extra("comfy_user_system_prompt") is None:
-                event.set_extra("comfy_user_system_prompt", getattr(req, "system_prompt", "") or "")
-            my_prompt = self._get_comfy_system_prompt()
-
-            if my_prompt:
-                current_prompt = getattr(req, "system_prompt", "") or ""
-                if my_prompt not in current_prompt:
-                    if current_prompt:
-                        req.system_prompt = f"{current_prompt}\n\n{my_prompt}".strip()
-                    else:
-                        req.system_prompt = my_prompt
-
-        except Exception as e:
-            logger.error(f"[ComfyUI] 注入提示词异常: {e}")
+    async def prepare_llm_request(self, event: AstrMessageEvent, req):
+        """保留补图所需的人格信息，并按渠道策略清理绘图提示词。"""
+        if event.get_extra("comfy_user_system_prompt") is None:
+            event.set_extra("comfy_user_system_prompt", getattr(req, "system_prompt", "") or "")
 
         try:
             self._inject_draw_failure_context(event, req)
@@ -620,46 +605,42 @@ class ComfyUIPlugin(Star):
         # 清理历史中的绘图提示词
         if self.discard_prompt_from_history:
             try:
-                if await self._is_prompt_history_keep_active(event, req):
-                    logger.info("[ComfyUI] 📝 当前会话保留绘图提示词历史，跳过请求上下文清理")
+                if self._is_prompt_history_keep_active(event):
+                    logger.info("[ComfyUI] 📝 当前渠道保留绘图提示词历史，跳过请求上下文清理")
                 else:
                     self._clean_pic_tags_from_req(req)
             except Exception as e:
                 logger.error(f"[ComfyUI] 清理提示词异常: {e}")
 
-    async def _get_current_conversation_id(self, event: AstrMessageEvent, req=None) -> str:
-        conversation = getattr(req, "conversation", None) if req is not None else None
-        conversation_id = getattr(conversation, "cid", None)
-        if conversation_id:
-            return str(conversation_id)
+    def _get_channel_key(self, event: AstrMessageEvent) -> str:
+        """平台实例 + 群号/私聊对象，不依赖 conversation 或群成员会话隔离。"""
+        platform = str(event.unified_msg_origin).split(":", 1)[0]
+        group_id = ""
+        if hasattr(event, "get_group_id"):
+            group_id = event.get_group_id()
+        group_id = group_id or self._get_group_id(event)
+        if group_id:
+            return json.dumps([platform, "group", str(group_id)], ensure_ascii=False)
+        return json.dumps([platform, "private", str(event.get_sender_id())], ensure_ascii=False)
 
-        try:
-            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
-                event.unified_msg_origin,
-            )
-        except Exception as e:
-            logger.warning(f"[ComfyUI] 获取当前会话 ID 失败: {e}")
-            return ""
-        return str(conversation_id or "")
+    def _is_prompt_history_keep_active(self, event: AstrMessageEvent) -> bool:
+        return self.channel_state.keep_history(self._get_channel_key(event))
 
-    async def _is_prompt_history_keep_active(self, event: AstrMessageEvent, req=None) -> bool:
-        """仅在全局清理开启时，判断当前 conversation 是否启用了保留例外。"""
-        if not self.discard_prompt_from_history:
-            return False
+    def _submission_recorder(self, event: AstrMessageEvent):
+        channel = self._get_channel_key(event)
+        user_id = str(event.get_sender_id())
 
-        unified_msg_origin = event.unified_msg_origin
-        enabled_conversation_id = self._prompt_history_keep_conversations.get(
-            unified_msg_origin,
-        )
-        if not enabled_conversation_id:
-            return False
+        def record(workflow_filename: str, payload: dict) -> None:
+            self.channel_state.append_record(channel, {
+                "record_id": str(uuid.uuid4()),
+                "submitted_at": time.time(),
+                "user_id": user_id,
+                "workflow": workflow_filename,
+                "url": f"{self.api.url}/prompt",
+                "request": payload,
+            })
 
-        current_conversation_id = await self._get_current_conversation_id(event, req)
-        if current_conversation_id != enabled_conversation_id:
-            self._prompt_history_keep_conversations.pop(unified_msg_origin, None)
-            logger.info("[ComfyUI] 🧹 检测到 conversation 已切换，提示词历史保留例外已自动关闭")
-            return False
-        return True
+        return record
 
     def _clean_pic_tags_from_req(self, req):
         """从请求的 conversation.history 中清理 <pic> 标签"""
@@ -970,28 +951,6 @@ class ComfyUIPlugin(Star):
             "guidance": "根据用户的人格/系统提示词和本次要求，结合模型声明选择提示词形式、风格及实际可用的 MCP/skill。文件名和 encoder_type 不是提示词能力证明；未知时查询用户指定资料或询问用户，不预制推荐。",
         }
 
-    def _get_comfy_system_prompt(self) -> str:
-        llm_settings = self.config.get("llm_settings", {}) or {}
-        my_prompt = (llm_settings.get("system_prompt", "") or "").strip()
-        # Upgrade only verbatim built-in defaults, never custom persona text.
-        if hashlib.sha256(my_prompt.encode("utf-8")).hexdigest() in {
-            "3c6284391679aeb398e774aa7df3738cf9c69d92388ffd2f38ced4ceea68a74a",
-            "422e34c432bdba497803f34b726ed426728a56b7f131b44aba95f3f922d0e573",
-        }:
-            with (PLUGIN_DIR / "_conf_schema.json").open(encoding="utf-8") as source:
-                my_prompt = json.load(source)["llm_settings"]["items"]["system_prompt"]["default"]
-        api = getattr(self, "api", None)
-        workflow_appendix = [
-            "【ComfyUI 工具入口】",
-            "仅在本轮已选择 ComfyUI 生图时使用；遵循用户的人格、后端选择和确认要求。",
-            "comfyui_usage：按需读取参数、LoRA 控制语法和失败处理说明。",
-            "comfyui_workflows：按需查询工作流、模型声明和实例补充说明。",
-            f"默认 workflow：{getattr(api, 'wf_filename', '') or '未配置'}；用户未指定时省略 workflow 参数。",
-            "LoRA 搜索、详情及管理使用实际可用的 LoRA MCP；本插件不自动注入库存清单。",
-        ]
-        my_prompt = f"{my_prompt}\n\n" + "\n".join(workflow_appendix)
-        return my_prompt.strip()
-
     @staticmethod
     def _coerce_conversation_history(raw_history) -> list:
         if raw_history is None:
@@ -1192,7 +1151,7 @@ class ComfyUIPlugin(Star):
             logger.warning(f"[ComfyUI] 读取当前会话上下文失败，继续使用空上下文补提示词: {e}")
 
         contexts = self._build_force_draw_contexts(conversation, latest_reply_text)
-        base_system_prompt = self._get_comfy_system_prompt()
+        base_system_prompt = event.get_extra("comfy_user_system_prompt") or ""
         # This direct provider call has no discovery tools. Supply only its
         # target workflow, never the full workflow or runtime LoRA catalogs.
         default_workflow = getattr(getattr(self, "api", None), "wf_filename", "")
@@ -1200,9 +1159,6 @@ class ComfyUIPlugin(Star):
             base_system_prompt += "\n\n本次补图使用的默认工作流资料：\n" + json.dumps(
                 self._get_workflow_catalog(default_workflow), ensure_ascii=False,
             )
-        user_system_prompt = event.get_extra("comfy_user_system_prompt") or ""
-        if user_system_prompt:
-            base_system_prompt = f"{user_system_prompt}\n\n{base_system_prompt}"
         latest_reply_excerpt = re.sub(r"\s+", " ", latest_reply_text).strip()
         if len(latest_reply_excerpt) > 1200:
             latest_reply_excerpt = latest_reply_excerpt[:1199].rstrip() + "…"
@@ -1331,6 +1287,7 @@ class ComfyUIPlugin(Star):
         self.context.activate_llm_tool("comfyui_txt2img")
         self.context.activate_llm_tool("comfyui_workflows")
         self.context.activate_llm_tool("comfyui_usage")
+        self.context.activate_llm_tool("comfy_record")
         self._auto_update_schema()
         self._workflow_schema_watch_task = asyncio.create_task(
             self._watch_workflow_schema(),
@@ -1484,7 +1441,7 @@ class ComfyUIPlugin(Star):
                 "  /comfy_save            导入新工作流",
                 "  /comfy_add             步数覆盖（按节点ID）",
                 "  /comfy_lock on|off     切换全局锁定",
-                "  /comfy_history on|off  当前会话保留提示词历史",
+                "  /comfy_history on|off  当前渠道保留提示词历史（跨 /new）",
                 "  /违禁级别              设置群敏感度",
                 ""
             ])
@@ -1834,7 +1791,7 @@ class ComfyUIPlugin(Star):
 
     @filter.command("comfy_history", aliases=["提示词历史", "提示词保留"])
     async def cmd_comfy_history(self, event: AstrMessageEvent):
-        """管理员为当前 conversation 设置提示词历史清理例外。"""
+        """管理员为当前群聊/私聊设置持久化的提示词历史清理例外。"""
         user_id = str(event.get_sender_id())
         if user_id not in self.admin_user_ids:
             yield event.plain_result("🚫 权限不足，仅管理员可切换提示词历史保留")
@@ -1842,54 +1799,40 @@ class ComfyUIPlugin(Star):
 
         args = event.message_str.split()
         action = args[1].lower() if len(args) > 1 else "status"
-        unified_msg_origin = event.unified_msg_origin
-
-        if action in ("off", "false", "0", "disable", "stop", "关闭"):
-            self._prompt_history_keep_conversations.pop(unified_msg_origin, None)
-            logger.info(f"[ComfyUI] 管理员 {user_id} 关闭当前会话提示词历史保留例外")
-            yield event.plain_result("🧹 已关闭当前会话的提示词历史保留，恢复全局清理策略")
-            return
-
-        if not self.discard_prompt_from_history:
-            yield event.plain_result(
-                "ℹ️ 全局配置当前为“不清理提示词历史”，所有会话都会保留提示词，"
-                "会话级例外开关无需生效。"
-            )
-            return
-
-        current_conversation_id = await self._get_current_conversation_id(event)
-        is_active = (
-            bool(current_conversation_id)
-            and self._prompt_history_keep_conversations.get(unified_msg_origin)
-            == current_conversation_id
-        )
+        channel = self._get_channel_key(event)
+        is_active = self.channel_state.keep_history(channel)
 
         if action in ("status", "状态", "查询"):
-            if not is_active:
-                self._prompt_history_keep_conversations.pop(unified_msg_origin, None)
             yield event.plain_result(
-                "📝 当前会话提示词历史保留\n"
+                "📝 当前渠道提示词历史保留\n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"当前: {'开启' if is_active else '关闭'}\n"
-                "全局策略: 清理提示词历史\n"
+                f"全局策略: {'清理提示词历史' if self.discard_prompt_from_history else '保留提示词历史'}\n"
                 "用法: /comfy_history on|off|status\n"
-                "说明: /new 创建新会话后会自动恢复关闭"
+                "说明: 对当前群聊/私聊生效，跨 /new 和插件重启保留；关闭时遵循全局策略"
             )
             return
 
         if action in ("on", "true", "1", "enable", "start", "开启"):
-            if not current_conversation_id:
-                yield event.plain_result("⚠️ 当前没有可用的 LLM 会话，请先开始对话或使用 /new")
-                return
-            self._prompt_history_keep_conversations[unified_msg_origin] = current_conversation_id
-            logger.warning(f"[ComfyUI] 管理员 {user_id} 开启当前会话提示词历史保留例外")
-            yield event.plain_result(
-                "📝 已开启当前会话的提示词历史保留。\n"
-                "仅当前会话生效；使用 /new 创建新会话后将自动关闭。"
-            )
+            enabled = True
+        elif action in ("off", "false", "0", "disable", "stop", "关闭"):
+            enabled = False
+        else:
+            yield event.plain_result("❌ 参数无效，用法：/comfy_history on|off|status")
             return
 
-        yield event.plain_result("❌ 参数无效，用法：/comfy_history on|off|status")
+        try:
+            self.channel_state.set_keep_history(channel, enabled)
+        except OSError as e:
+            logger.error(f"[ComfyUI] 保存渠道历史开关失败: {e}")
+            yield event.plain_result("❌ 保存渠道历史开关失败，设置未更改")
+            return
+
+        logger.info(f"[ComfyUI] 管理员 {user_id} 设置渠道 {channel} 提示词历史保留: {enabled}")
+        if enabled:
+            yield event.plain_result("📝 已开启当前渠道的提示词历史保留，跨 /new 和插件重启生效。")
+        else:
+            yield event.plain_result("🧹 已关闭当前渠道的提示词历史保留，恢复全局清理策略。")
 
     @filter.command("comfy_ls")
     async def cmd_comfy_list(self, event: AstrMessageEvent):
@@ -2627,7 +2570,7 @@ class ComfyUIPlugin(Star):
 
         cleaned_prompts = [item["prompt"] for item in cleaned_entries]
         use_multi_image_mode = self._should_use_multi_image_mode(len(cleaned_entries))
-        keep_prompt_history = await self._is_prompt_history_keep_active(event)
+        keep_prompt_history = self._is_prompt_history_keep_active(event)
     
         # 单图模式
         if not use_multi_image_mode:
@@ -2912,7 +2855,11 @@ class ComfyUIPlugin(Star):
                 return
 
             logger.info(f"[ComfyUI] 🎨 异步生成开始 | Prompt: {prompt}")
-            img_data, error_msg = await self.api.generate(prompt, lora_selections=lora_selections)
+            img_data, error_msg = await self.api.generate(
+                prompt,
+                lora_selections=lora_selections,
+                on_submit=self._submission_recorder(event),
+            )
 
             if not img_data:
                 message = f"❌ 图片生成失败：{error_msg}"
@@ -2956,7 +2903,7 @@ class ComfyUIPlugin(Star):
         if not self.discard_prompt_from_history:
             return
 
-        if await self._is_prompt_history_keep_active(event):
+        if self._is_prompt_history_keep_active(event):
             return
 
         # 只在有提取到提示词时才需要清理
@@ -3044,6 +2991,7 @@ class ComfyUIPlugin(Star):
                 prompt_id, error_msg = await self.api.submit(
                     marker.prompt,
                     lora_selections=marker.lora_selections,
+                    on_submit=self._submission_recorder(event),
                 )
                 if not prompt_id:
                     return group, {
@@ -3166,6 +3114,7 @@ class ComfyUIPlugin(Star):
 
     async def _submit_repeated_batch(
         self,
+        event: AstrMessageEvent,
         prompt: str,
         count: int,
         lora_selections=None,
@@ -3179,6 +3128,7 @@ class ComfyUIPlugin(Star):
                     lora_selections=lora_selections,
                     negative_prompt=negative_prompt,
                     workflow_filename=workflow,
+                    on_submit=self._submission_recorder(event),
                 )
                 if not prompt_id:
                     return {
@@ -3402,6 +3352,42 @@ class ComfyUIPlugin(Star):
             state["finished"] = True
             event.set_extra(self._BATCH_WAIT_STATE_EXTRA, None)
         return True
+
+    @llm_tool(name="comfy_record")
+    async def comfy_record(
+        self, event: AstrMessageEvent, action: str = "list", count: int = 1,
+    ) -> str:
+        """查看或先进先出取出当前群聊/私聊最近 20 次绘图提交的完整请求。
+
+        自动记录所有实际发往 ComfyUI /prompt 的请求，包括被拒绝或网络失败的提交尝试；
+        每次提交单独一条，超过 20 条自动淘汰最旧记录，与 comfy_history 开关无关。
+        request 是执行侧收到的完整 JSON（workflow 节点、最终正负提示词、种子、LoRA 等），
+        不是原始工具调用参数。记录按平台实例及群聊/私聊隔离，跨 /new 保留；插件重启清空。
+        list 只读返回全部记录，从旧到新；pop 从队首取出并删除指定数量的最旧记录。
+        不重新提交绘图，不修改其他渠道的记录。
+
+        Args:
+            action(string): list 查看全部记录（默认）；pop 取出并删除队首记录。
+            count(int): 仅 pop 使用，取出数量 1 到 20，默认 1。
+        """
+        allowed, reason = self._check_access(event)
+        if not allowed:
+            return reason
+        if action not in ("list", "pop"):
+            return json.dumps({"error": "action 只能是 list 或 pop"}, ensure_ascii=False)
+        if type(count) is not int or not 1 <= count <= ChannelState.RECORD_LIMIT:
+            return json.dumps({"error": "count 必须为 1 到 20 的整数"}, ensure_ascii=False)
+        channel = self._get_channel_key(event)
+        pop_count = 0
+        if action == "pop":
+            pop_count = count
+        records = self.channel_state.read_records(channel, pop_count)
+        return json.dumps({
+            "action": action,
+            "records": records,
+            "remaining": self.channel_state.record_count(channel),
+            "capacity": ChannelState.RECORD_LIMIT,
+        }, ensure_ascii=False)
 
     @llm_tool(name="comfyui_usage")
     async def comfyui_usage(self, event: AstrMessageEvent) -> str:
@@ -3644,6 +3630,7 @@ class ComfyUIPlugin(Star):
 
             if requested_count > 1:
                 submitted_items = await self._submit_repeated_batch(
+                    event,
                     prompt,
                     requested_count,
                     lora_selections=lora_selections,
@@ -3854,6 +3841,7 @@ class ComfyUIPlugin(Star):
                 lora_selections=lora_selections,
                 negative_prompt=negative_prompt,
                 workflow_filename=workflow,
+                on_submit=self._submission_recorder(event),
             )
 
             if not img_data:
